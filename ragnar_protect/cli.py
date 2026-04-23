@@ -184,7 +184,7 @@ def main() -> int:
             _emit_output(f"{key}: {value}")
 
     if args.check_updates:
-        status = engine.check_updates(auto_download=True)
+        status = engine.check_updates(auto_download=True, auto_apply=True)
         for key, value in status.items():
             _emit_output(f"{key}: {value}")
 

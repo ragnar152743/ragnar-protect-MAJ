@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import base64
 import json
+import os
+import subprocess
 import sys
 import threading
 import time
@@ -10,6 +12,7 @@ from typing import Any
 
 import requests
 
+from .hidden_process import popen_hidden
 from .config import (
     APP_NAME,
     PACKAGE_ROOT,
@@ -23,6 +26,11 @@ from .config import (
 )
 from .logging_setup import get_logger
 from .version import APP_VERSION
+
+try:
+    import psutil  # type: ignore
+except Exception:  # pragma: no cover
+    psutil = None
 
 
 class GitHubUpdateManager:
@@ -91,9 +99,10 @@ class GitHubUpdateManager:
         payload.setdefault("current_version", APP_VERSION)
         payload.setdefault("current_executable", str(self.current_executable_path) if self.current_executable_path else "")
         payload.setdefault("available", self.available)
+        payload.setdefault("can_self_update", self.can_self_update_in_place())
         return payload
 
-    def check_now(self, auto_download: bool = True) -> dict[str, object]:
+    def check_now(self, auto_download: bool = True, auto_apply: bool = False) -> dict[str, object]:
         base_status = {
             "available": self.available,
             "repository": self.repository,
@@ -131,6 +140,7 @@ class GitHubUpdateManager:
                 "staged_path": "",
                 "staged_sha256": "",
                 "downloaded": False,
+                "apply_started": False,
             }
 
             if not same_version or not same_hash:
@@ -143,6 +153,10 @@ class GitHubUpdateManager:
                     status["staged_path"] = str(staged_path)
                     status["staged_sha256"] = self._sha256(staged_path)
                     status["downloaded"] = True
+                    if auto_apply and self.can_self_update_in_place():
+                        apply_status = self.apply_staged_update(staged_path=staged_path)
+                        status.update(apply_status)
+                        status["downloaded"] = True
 
             self.logger.info(
                 "update check complete | state=%s current=%s remote=%s",
@@ -163,9 +177,77 @@ class GitHubUpdateManager:
             return status
 
     def _loop(self) -> None:
-        self.check_now(auto_download=True)
+        self.check_now(auto_download=True, auto_apply=self.can_self_update_in_place())
         while not self._stop_event.wait(self.interval_seconds):
-            self.check_now(auto_download=True)
+            self.check_now(auto_download=True, auto_apply=self.can_self_update_in_place())
+
+    def can_self_update_in_place(self) -> bool:
+        if not getattr(sys, "frozen", False):
+            return False
+        if self.current_executable_path is None or not self.current_executable_path.exists():
+            return False
+        try:
+            return self.current_executable_path.resolve() == Path(sys.executable).resolve()
+        except OSError:
+            return False
+
+    def apply_staged_update(
+        self,
+        staged_path: Path | str | None = None,
+        restart_commands: list[list[str]] | None = None,
+    ) -> dict[str, object]:
+        if self.current_executable_path is None or not self.current_executable_path.exists():
+            raise FileNotFoundError("Current executable path is unavailable.")
+        candidate = Path(staged_path) if staged_path is not None else self._resolve_staged_update_path()
+        candidate = candidate.expanduser().resolve()
+        if not candidate.exists():
+            raise FileNotFoundError(candidate)
+        if not self.can_self_update_in_place():
+            raise RuntimeError("Background self-update can only be applied from the installed RagnarProtect.exe process.")
+        managed_processes = self._collect_managed_processes()
+        process_ids = [int(item["pid"]) for item in managed_processes if int(item.get("pid") or 0) > 0]
+        restart_specs = restart_commands if restart_commands is not None else self._build_restart_commands(managed_processes)
+        script_path, plan_path = self._write_apply_update_bundle(candidate, process_ids, restart_specs)
+        process = self._launch_apply_helper(script_path, plan_path)
+        status = {
+            "state": "update_applying",
+            "message": "Background update apply started.",
+            "staged_path": str(candidate),
+            "staged_sha256": self._sha256(candidate),
+            "apply_started": True,
+            "apply_pid": process.pid,
+            "restart_command_count": len(restart_specs),
+            "current_sha256": self._sha256(self.current_executable_path),
+            "remote_version": self._version_from_staged_name(candidate),
+        }
+        self.logger.warning(
+            "background update apply started | apply_pid=%s staged=%s targets=%s relaunch=%s",
+            process.pid,
+            candidate,
+            process_ids,
+            len(restart_specs),
+        )
+        self._write_status({**self.status(), **status})
+        return status
+
+    def _launch_apply_helper(self, script_path: Path, plan_path: Path):
+        return popen_hidden(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(script_path),
+                "-PlanPath",
+                str(plan_path),
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+        )
 
     def _fetch_manifest(self) -> dict[str, Any]:
         response = self.session.get(
@@ -243,6 +325,16 @@ class GitHubUpdateManager:
         temp_path.replace(final_path)
         return final_path
 
+    def _resolve_staged_update_path(self) -> Path:
+        status = self._read_status()
+        staged = str(status.get("staged_path") or "").strip()
+        if staged:
+            return Path(staged)
+        candidates = sorted(UPDATES_DIR.glob("RagnarProtect-*.exe"), key=lambda item: item.stat().st_mtime, reverse=True)
+        if not candidates:
+            raise FileNotFoundError("No staged update found.")
+        return candidates[0]
+
     def _resolve_current_executable(self) -> Path | None:
         if getattr(sys, "frozen", False):
             return Path(sys.executable).resolve()
@@ -256,6 +348,183 @@ class GitHubUpdateManager:
             return "", ""
         owner, repo = self.repository.split("/", 1)
         return owner.strip(), repo.strip()
+
+    def _collect_managed_processes(self) -> list[dict[str, object]]:
+        executable = self.current_executable_path
+        if executable is None:
+            return []
+        executable_text = str(executable).lower()
+        managed: list[dict[str, object]] = []
+        if psutil is None:
+            return [
+                {
+                    "pid": os.getpid(),
+                    "cmdline": [str(executable), *sys.argv[1:]],
+                }
+            ]
+        seen: set[tuple[str, ...]] = set()
+        for proc in psutil.process_iter(["pid", "exe", "cmdline"]):
+            try:
+                exe = str(proc.info.get("exe") or proc.exe() or "").lower()
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess, OSError):
+                continue
+            if exe != executable_text:
+                continue
+            try:
+                raw_cmdline = proc.info.get("cmdline") or proc.cmdline()
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess, OSError):
+                raw_cmdline = []
+            cmdline = [str(item) for item in raw_cmdline if str(item).strip()]
+            if not cmdline:
+                cmdline = [str(executable)]
+            sanitized = tuple(self._sanitize_restart_command(cmdline))
+            if sanitized in seen:
+                managed.append({"pid": int(proc.pid), "cmdline": list(sanitized)})
+                continue
+            seen.add(sanitized)
+            managed.append({"pid": int(proc.pid), "cmdline": list(sanitized)})
+        current = tuple(self._sanitize_restart_command([str(executable), *sys.argv[1:]]))
+        if current and current not in seen and self._current_process_matches_executable(executable_text):
+            managed.append({"pid": int(os.getpid()), "cmdline": list(current)})
+        return managed
+
+    def _current_process_matches_executable(self, executable_text: str) -> bool:
+        if not executable_text:
+            return False
+        if psutil is None:
+            return getattr(sys, "frozen", False)
+        try:
+            current_exe = str(psutil.Process(os.getpid()).exe() or "").lower()
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess, OSError):
+            return False
+        return current_exe == executable_text
+
+    def _build_restart_commands(self, processes: list[dict[str, object]]) -> list[list[str]]:
+        commands: list[list[str]] = []
+        seen: set[tuple[str, ...]] = set()
+        for item in processes:
+            raw_cmdline = item.get("cmdline") or []
+            if not isinstance(raw_cmdline, list):
+                continue
+            cmdline = [str(part) for part in raw_cmdline if str(part).strip()]
+            if not cmdline:
+                continue
+            key = tuple(cmdline)
+            if key in seen:
+                continue
+            seen.add(key)
+            commands.append(cmdline)
+        return commands
+
+    def _sanitize_restart_command(self, cmdline: list[str]) -> list[str]:
+        if not cmdline:
+            return []
+        cleaned = [cmdline[0]]
+        skip_next = False
+        transient_flags = {"--check-updates", "--update-status", "--apply-update"}
+        value_flags = {"--monitor-seconds"}
+        for arg in cmdline[1:]:
+            lowered = arg.lower()
+            if skip_next:
+                skip_next = False
+                continue
+            if lowered in transient_flags:
+                continue
+            if lowered in value_flags:
+                skip_next = True
+                continue
+            cleaned.append(arg)
+        if len(cleaned) == 2 and cleaned[1].lower() == "--nogui":
+            return []
+        return cleaned
+
+    def _write_apply_update_bundle(
+        self,
+        staged_path: Path,
+        process_ids: list[int],
+        restart_commands: list[list[str]],
+    ) -> tuple[Path, Path]:
+        ensure_app_dirs()
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        plan_path = UPDATES_DIR / f"apply_update_{timestamp}.json"
+        script_path = UPDATES_DIR / f"apply_update_{timestamp}.ps1"
+        plan = {
+            "current_executable": str(self.current_executable_path),
+            "staged_executable": str(staged_path),
+            "status_path": str(self._status_path),
+            "process_ids": process_ids,
+            "restart_commands": restart_commands,
+            "app_name": APP_NAME,
+        }
+        plan_path.write_text(json.dumps(plan, ensure_ascii=True, indent=2), encoding="utf-8")
+        script_path.write_text(self._build_apply_update_script(), encoding="utf-8")
+        return script_path, plan_path
+
+    def _build_apply_update_script(self) -> str:
+        return (
+            "param([Parameter(Mandatory=$true)][string]$PlanPath)\n"
+            "$ErrorActionPreference = 'Stop'\n"
+            "$plan = Get-Content -Raw -LiteralPath $PlanPath | ConvertFrom-Json\n"
+            "$statusPath = [string]$plan.status_path\n"
+            "function Write-Status($state, $message, $extra) {\n"
+            "  $payload = [ordered]@{ state = $state; message = $message; updated_at = (Get-Date).ToString('s') }\n"
+            "  if ($extra) { foreach ($entry in $extra.GetEnumerator()) { $payload[$entry.Key] = $entry.Value } }\n"
+            "  ($payload | ConvertTo-Json -Depth 6) | Set-Content -LiteralPath $statusPath -Encoding UTF8\n"
+            "}\n"
+            "try {\n"
+            "  $currentExe = [string]$plan.current_executable\n"
+            "  $stagedExe = [string]$plan.staged_executable\n"
+            "  $processIds = @($plan.process_ids)\n"
+            "  $restartCommands = @($plan.restart_commands)\n"
+            "  Write-Status 'update_applying' 'Stopping Ragnar Protect processes.' @{ staged_path = $stagedExe; apply_started = $true }\n"
+            "  foreach ($targetPid in $processIds) {\n"
+            "    if ($targetPid -and $targetPid -ne $PID) { Stop-Process -Id $targetPid -Force -ErrorAction SilentlyContinue }\n"
+            "  }\n"
+            "  $waitIds = @($processIds | Where-Object { $_ -and $_ -ne $PID })\n"
+            "  if ($waitIds.Count -gt 0) { Wait-Process -Id $waitIds -Timeout 30 -ErrorAction SilentlyContinue }\n"
+            "  $backupExe = \"$currentExe.bak\"\n"
+            "  $applied = $false\n"
+            "  for ($attempt = 0; $attempt -lt 45 -and -not $applied; $attempt++) {\n"
+            "    try {\n"
+            "      if (Test-Path -LiteralPath $backupExe) { Remove-Item -LiteralPath $backupExe -Force -ErrorAction SilentlyContinue }\n"
+            "      if (Test-Path -LiteralPath $currentExe) { Move-Item -LiteralPath $currentExe -Destination $backupExe -Force }\n"
+            "      Move-Item -LiteralPath $stagedExe -Destination $currentExe -Force\n"
+            "      Remove-Item -LiteralPath $stagedExe -Force -ErrorAction SilentlyContinue\n"
+            "      Remove-Item -LiteralPath $backupExe -Force -ErrorAction SilentlyContinue\n"
+            "      $applied = $true\n"
+            "    } catch {\n"
+            "      Start-Sleep -Seconds 1\n"
+            "    }\n"
+            "  }\n"
+            "  if (-not $applied) {\n"
+            "    if ((Test-Path -LiteralPath $backupExe) -and -not (Test-Path -LiteralPath $currentExe)) {\n"
+            "      Move-Item -LiteralPath $backupExe -Destination $currentExe -Force -ErrorAction SilentlyContinue\n"
+            "    }\n"
+            "    Write-Status 'error' 'Background update apply failed.' @{ staged_path = $stagedExe }\n"
+            "    exit 1\n"
+            "  }\n"
+            "  foreach ($command in $restartCommands) {\n"
+            "    if (-not $command -or $command.Count -lt 1) { continue }\n"
+            "    $args = @()\n"
+            "    if ($command.Count -gt 1) { $args = @($command[1..($command.Count - 1)]) }\n"
+            "    if ($args -contains '--nogui') {\n"
+            "      Start-Process -FilePath $currentExe -ArgumentList $args -WorkingDirectory (Split-Path -Parent $currentExe) -WindowStyle Hidden\n"
+            "    } else {\n"
+            "      Start-Process -FilePath $currentExe -ArgumentList $args -WorkingDirectory (Split-Path -Parent $currentExe)\n"
+            "    }\n"
+            "  }\n"
+            "  Write-Status 'update_applied' 'Update applied and Ragnar Protect restarted.' @{ staged_path = $stagedExe; restart_command_count = $restartCommands.Count }\n"
+            "} catch {\n"
+            "  Write-Status 'error' $_.Exception.Message @{ staged_path = [string]$plan.staged_executable }\n"
+            "  exit 1\n"
+            "}\n"
+        )
+
+    def _version_from_staged_name(self, staged_path: Path) -> str:
+        name = staged_path.stem
+        if "-" not in name:
+            return ""
+        return name.rsplit("-", 1)[-1]
 
     def _read_status(self) -> dict[str, object]:
         try:

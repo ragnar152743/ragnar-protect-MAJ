@@ -142,8 +142,8 @@ class RagnarProtectEngine:
     def run_benchmark(self, corpus_dir: str) -> dict[str, object]:
         return self.benchmark_runner.run(corpus_dir).to_dict()
 
-    def check_updates(self, auto_download: bool = True) -> dict[str, object]:
-        return self.updater.check_now(auto_download=auto_download)
+    def check_updates(self, auto_download: bool = True, auto_apply: bool = False) -> dict[str, object]:
+        return self.updater.check_now(auto_download=auto_download, auto_apply=auto_apply)
 
     def update_status(self) -> dict[str, object]:
         return self.updater.status()

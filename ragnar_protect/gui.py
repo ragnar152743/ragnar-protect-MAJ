@@ -601,7 +601,7 @@ class RagnarProtectApp(tk.Tk):
 
     def _check_updates_worker(self) -> None:
         try:
-            result = self.engine.check_updates(auto_download=True)
+            result = self.engine.check_updates(auto_download=True, auto_apply=True)
             lines = [f"{key}: {value}" for key, value in result.items()]
             text = "\n".join(lines)
         except Exception as exc:
