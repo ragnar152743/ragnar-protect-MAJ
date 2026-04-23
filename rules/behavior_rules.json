@@ -94,5 +94,17 @@
     "score": 35,
     "pattern": "(?i)(your\\s+files\\s+(?:have\\s+been|are)\\s+encrypted|how[_ -]?to[_ -]?decrypt|restore[_ -]?my[_ -]?files|recover[_ -]?files|decrypt\\s+instructions|bitcoin\\s+wallet|private\\s+key)",
     "description": "Ransom note language"
+  },
+  {
+    "name": "ragnar_self_tamper",
+    "score": 60,
+    "pattern": "(?i)\\b(taskkill(?:\\.exe)?\\s+.*(?:ragnarprotect\\.exe|ragnarnativehelper\\.exe)|Stop-Process\\b.*(?:RagnarProtect|RagnarNativeHelper)|wmic(?:\\.exe)?\\s+process\\b.*(?:RagnarProtect\\.exe|RagnarNativeHelper\\.exe).*\\bdelete\\b|(?:Remove-Item|del|erase)\\b.*(?:RagnarProtect|RagnarNativeHelper|background_worker\\.json|background_watchdog\\.json))",
+    "description": "Attempt to terminate or delete Ragnar Protect components"
+  },
+  {
+    "name": "startup_task_tamper",
+    "score": 55,
+    "pattern": "(?i)\\b(schtasks(?:\\.exe)?\\s+/delete\\s+/tn\\s+\\\"?Ragnar Protect (?:Background Protection|Watchdog)\\\"?|Unregister-ScheduledTask\\b.*Ragnar Protect (?:Background Protection|Watchdog))",
+    "description": "Attempt to delete Ragnar Protect startup tasks"
   }
 ]

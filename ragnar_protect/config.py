@@ -31,6 +31,13 @@ LOGO_PNG = ASSETS_DIR / "ragnar_protect_logo.png"
 LOGO_ICON = ASSETS_DIR / "ragnar_protect.ico"
 WINDOWS_SANDBOX_EXE = Path(r"C:\Windows\System32\WindowsSandbox.exe")
 WINDOWS_SANDBOX_CLI = shutil.which("wsb") or ""
+PYINSTALLER_RUNTIME_MARKERS = {"assets", "rules", "native_helper"}
+RAGNAR_LEGACY_TEMP_MARKERS = (
+    "ragnar-native-sandbox",
+    "ragnar-native-watch",
+    "ragnar-sandbox-test",
+    "ragnar-launch-intercept",
+)
 
 DESKTOP_DIR = Path.home() / "Desktop"
 DOWNLOADS_DIR = Path.home() / "Downloads"
@@ -165,6 +172,18 @@ SUSPICIOUS_PATTERNS = [
         "pattern": r"(?i)\b(Add-Type|Reflection\.Assembly|FromBase64String|EncodedCommand|ScheduledTask|schtasks)\b",
         "description": "Obfuscated or persistence-oriented script behavior",
     },
+    {
+        "name": "ragnar_self_tamper",
+        "score": 60,
+        "pattern": r"(?i)\b(taskkill(?:\.exe)?\s+.*(?:ragnarprotect\.exe|ragnarnativehelper\.exe)|Stop-Process\b.*(?:RagnarProtect|RagnarNativeHelper)|wmic(?:\.exe)?\s+process\b.*(?:RagnarProtect\.exe|RagnarNativeHelper\.exe).*\bdelete\b|(?:Remove-Item|del|erase)\b.*(?:RagnarProtect|RagnarNativeHelper|background_worker\.json|background_watchdog\.json))",
+        "description": "Attempt to terminate or delete Ragnar Protect components",
+    },
+    {
+        "name": "startup_task_tamper",
+        "score": 55,
+        "pattern": r"(?i)\b(schtasks(?:\.exe)?\s+/delete\s+/tn\s+\"?Ragnar Protect (?:Background Protection|Watchdog)\"?|Unregister-ScheduledTask\b.*Ragnar Protect (?:Background Protection|Watchdog))",
+        "description": "Attempt to delete Ragnar Protect startup tasks",
+    },
 ]
 
 SUSPICIOUS_THRESHOLD = 35
@@ -187,7 +206,22 @@ HIGH_RISK_PROCESS_NAMES = {
     "cipher.exe",
     "schtasks.exe",
     "reg.exe",
+    "taskkill.exe",
+    "sc.exe",
+    "net.exe",
+    "net1.exe",
 }
+RAGNAR_PROTECTED_NAME_TOKENS = (
+    "ragnarprotect.exe",
+    "ragnar protect",
+    "ragnarnativehelper.exe",
+    "background_worker.json",
+    "background_watchdog.json",
+)
+RAGNAR_PROTECTED_TASK_TOKENS = (
+    "ragnar protect background protection",
+    "ragnar protect watchdog",
+)
 USER_SPACE_HINTS = {
     str(Path.home()).lower(),
     str(DOWNLOADS_DIR).lower(),
@@ -203,6 +237,8 @@ BEHAVIOR_MODIFY_WINDOW_SECONDS = 30
 BEHAVIOR_CREATE_THRESHOLD = 8
 BEHAVIOR_CREATE_WINDOW_SECONDS = 20
 BEHAVIOR_SENSITIVE_ZONE_THRESHOLD = 3
+RANSOMWARE_EARLY_RENAME_THRESHOLD = 4
+RANSOMWARE_HARD_KILL_RENAME_THRESHOLD = 8
 BACKGROUND_CPU_PAUSE_THRESHOLD = 65
 BACKGROUND_DISK_PAUSE_THRESHOLD = 70
 BACKGROUND_BATCH_SIZE = 8
@@ -217,11 +253,15 @@ STAGE5_DEEP_TIMEOUT_SECONDS = 30
 LAUNCH_HOLD_TIMEOUT_SECONDS = 45
 NATIVE_WATCHER_POLL_MILLISECONDS = 150
 NATIVE_WATCHER_STALE_SECONDS = 45
+WATCHDOG_POLL_SECONDS = int(os.getenv("RAGNAR_WATCHDOG_POLL_SECONDS", "5"))
+WATCHDOG_UPDATE_GRACE_SECONDS = int(os.getenv("RAGNAR_WATCHDOG_UPDATE_GRACE_SECONDS", "120"))
 CANARY_ENABLED = os.getenv("RAGNAR_CANARY_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
 CANARY_FILE_NAMES = (
     "RAGNAR_GUARD_DO_NOT_TOUCH.txt",
     "RAGNAR_RECOVERY_CHECK.txt",
 )
+CANARY_MAX_SUBDIR_DEPTH = int(os.getenv("RAGNAR_CANARY_MAX_SUBDIR_DEPTH", "1"))
+CANARY_MAX_DIRS_PER_ROOT = int(os.getenv("RAGNAR_CANARY_MAX_DIRS_PER_ROOT", "64"))
 CANARY_PROTECTED_DIRS = [
     DOCUMENTS_DIR,
     DESKTOP_DIR,
@@ -291,7 +331,42 @@ def is_managed_path(path: str | Path) -> bool:
                 return True
         except ValueError:
             continue
+    if _is_ragnar_pyinstaller_runtime_path(resolved):
+        return True
+    if _is_ragnar_legacy_temp_path(resolved):
+        return True
     return False
+
+
+def _is_ragnar_pyinstaller_runtime_path(resolved: Path) -> bool:
+    parts = [part.lower() for part in resolved.parts]
+    mei_index = next((index for index, part in enumerate(parts) if part.startswith("_mei")), -1)
+    if mei_index <= 0:
+        return False
+    temp_root = str(TEMP_DIR.resolve()).lower()
+    if not str(resolved).lower().startswith(temp_root):
+        return False
+    bundle_root = Path(*resolved.parts[: mei_index + 1])
+    if any(marker in parts for marker in PYINSTALLER_RUNTIME_MARKERS):
+        return True
+    try:
+        siblings = {child.name.lower() for child in bundle_root.iterdir()}
+    except OSError:
+        siblings = set()
+    return bool(PYINSTALLER_RUNTIME_MARKERS.intersection(siblings))
+
+
+def _is_ragnar_legacy_temp_path(resolved: Path) -> bool:
+    try:
+        temp_root = TEMP_DIR.resolve()
+    except OSError:
+        temp_root = TEMP_DIR
+    try:
+        resolved.relative_to(temp_root)
+    except ValueError:
+        return False
+    lowered_parts = [part.lower() for part in resolved.parts]
+    return any(marker in lowered_parts for marker in RAGNAR_LEGACY_TEMP_MARKERS)
 
 
 def get_resend_api_key_file_candidates() -> list[Path]:

@@ -4,7 +4,7 @@ import argparse
 import os
 import time
 
-from .background_runtime import register_background_worker, unregister_background_worker
+from .background_runtime import ensure_watchdog_worker, register_background_worker, run_watchdog_loop, unregister_background_worker, unregister_watchdog_worker
 from .config import APP_DIR, ensure_app_dirs
 from .engine import RagnarProtectEngine
 from .gui import RagnarProtectApp
@@ -24,6 +24,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="When protection is auto-started without admin rights, keep user-mode protection instead of prompting for elevation",
     )
+    parser.add_argument("--watchdog", action="store_true", help="Internal watchdog mode that relaunches background protection if it is killed")
     parser.add_argument("--install-startup", action="store_true", help="Install a highest-privilege startup task")
     parser.add_argument("--remove-startup", action="store_true", help="Remove the startup task")
     parser.add_argument("--quick-scan", action="store_true", help="Run a quick targeted system scan")
@@ -54,6 +55,7 @@ def _has_explicit_cli_action(args: argparse.Namespace) -> bool:
             args.prepare_exe_sandbox,
             args.launch_exe_sandbox,
             args.protect,
+            getattr(args, "watchdog", False),
             args.install_startup,
             args.remove_startup,
             args.quick_scan,
@@ -111,6 +113,15 @@ def _emit_output(text: str) -> None:
 def main() -> int:
     args = build_parser().parse_args()
     engine = RagnarProtectEngine()
+
+    if getattr(args, "watchdog", False):
+        try:
+            run_watchdog_loop()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            unregister_watchdog_worker(expected_pid=os.getpid())
+        return 0
 
     if args.install_startup:
         if not is_admin():
@@ -229,6 +240,7 @@ def main() -> int:
             if not reduced_mode and is_admin() and not startup_task_exists():
                 install_startup_task()
             register_background_worker(reduced_mode=reduced_mode)
+            ensure_watchdog_worker()
             engine.start_protection(reduced_mode=reduced_mode)
             _emit_output("Background protection active. Press Ctrl+C to stop.")
             while True:

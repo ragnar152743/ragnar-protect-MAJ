@@ -13,6 +13,8 @@ from .config import (
     LAUNCH_ALLOW_CACHE_SECONDS,
     LAUNCH_INTERCEPT_INTERVAL_SECONDS,
     PE_EXTENSIONS,
+    RAGNAR_PROTECTED_NAME_TOKENS,
+    RAGNAR_PROTECTED_TASK_TOKENS,
     SENSITIVE_EXTENSIONS,
     USER_SPACE_HINTS,
     is_managed_path,
@@ -121,18 +123,22 @@ class ProcessGuard:
         key = (pid, create_time)
         self._seen.add(key)
         self._last_scan[key] = time.time()
-        exe = str(event.get("executablePath") or proc.info.get("exe") or self._safe_process_call(proc, "exe") or "")
+        exe = str(event.get("executablePath") or self._process_info_value(proc, "exe") or self._safe_process_call(proc, "exe") or "")
         self._process_launch_gate(proc, key, exe, already_suspended=bool(event.get("suspended")))
 
     def _inspect_process(self, proc, key: tuple[int, float], first_seen: bool) -> None:
-        name = str(proc.info.get("name") or self._safe_process_call(proc, "name") or "")
-        exe = str(proc.info.get("exe") or self._safe_process_call(proc, "exe") or "")
-        raw_cmdline = proc.info.get("cmdline") or self._safe_process_call(proc, "cmdline") or []
+        name = str(self._process_info_value(proc, "name") or self._safe_process_call(proc, "name") or "")
+        exe = str(self._process_info_value(proc, "exe") or self._safe_process_call(proc, "exe") or "")
+        raw_cmdline = self._process_info_value(proc, "cmdline") or self._safe_process_call(proc, "cmdline") or []
         cmdline_list = [str(part) for part in raw_cmdline if part]
         cmdline = " ".join(cmdline_list)
         if "__PSScriptPolicyTest_" in cmdline:
             return
         if not cmdline and not exe:
+            return
+        tamper_reason = self._detect_ragnar_tamper_command(name, exe, cmdline_list)
+        if tamper_reason:
+            self._block_process_tree(proc, exe, tamper_reason)
             return
 
         if first_seen and key[1] >= self._started_at - 2:
@@ -266,6 +272,16 @@ class ProcessGuard:
         except Exception:
             return None
 
+    def _process_info_value(self, proc, key: str):
+        info = getattr(proc, "info", None)
+        if isinstance(info, dict):
+            value = info.get(key)
+            if value not in (None, "", []):
+                return value
+        if key == "pid":
+            return getattr(proc, "pid", 0)
+        return None
+
     def _suspend_process(self, proc) -> bool:
         try:
             proc.suspend()
@@ -370,6 +386,8 @@ class ProcessGuard:
             "cipher_wipe",
             "defender_tamper",
             "ransomware_note_phrase",
+            "ragnar_self_tamper",
+            "startup_task_tamper",
         }
         artifact_kinds = {item.kind for item in getattr(artifact_result, "findings", [])}
         payload_kinds = {item.kind for item in getattr(payload_result, "findings", [])} if payload_result is not None else set()
@@ -399,6 +417,36 @@ class ProcessGuard:
             return bool(artifact_kinds.intersection(critical_kinds))
 
         return False
+
+    def _detect_ragnar_tamper_command(self, process_name: str, exe: str, cmdline_list: list[str]) -> str | None:
+        lower_name = process_name.lower()
+        joined = " ".join(str(part) for part in cmdline_list if str(part).strip()).lower()
+        if not joined:
+            return None
+        if "apply_update_" in joined:
+            return None
+        targets_names = any(token in joined for token in RAGNAR_PROTECTED_NAME_TOKENS)
+        targets_tasks = any(token in joined for token in RAGNAR_PROTECTED_TASK_TOKENS)
+        if not (targets_names or targets_tasks):
+            return None
+
+        if lower_name == "schtasks.exe" and "/delete" in joined and targets_tasks:
+            return "Process guard self-protection: startup task tamper"
+
+        kill_tokens = (
+            "taskkill",
+            "stop-process",
+            "wmic",
+            "delete",
+            "terminate",
+            "remove-item",
+            " del ",
+            " erase ",
+        )
+        if lower_name in {"taskkill.exe", "powershell.exe", "pwsh.exe", "wmic.exe", "cmd.exe", "reg.exe"}:
+            if any(token in joined for token in kill_tokens):
+                return "Process guard self-protection: Ragnar tamper command"
+        return None
 
     def _is_clean_launch_result(self, result) -> bool:
         if result.status == "clean":
@@ -486,8 +534,8 @@ class ProcessGuard:
             source="launch_interceptor",
         )
         self.database.record_block_event(
-            pid=proc.info.get("pid"),
-            process_name=proc.info.get("name"),
+            pid=self._process_info_value(proc, "pid"),
+            process_name=self._process_info_value(proc, "name"),
             exe_path=exe,
             sha256=result.sha256,
             reason=reason,
@@ -501,7 +549,7 @@ class ProcessGuard:
         self.logger.warning(
             "launch intercepted for observation | pid=%s name=%s exe=%s",
             proc.pid,
-            proc.info.get("name"),
+            self._process_info_value(proc, "name"),
             exe,
         )
 
@@ -538,7 +586,7 @@ class ProcessGuard:
     def _block_process_tree(self, proc, exe: str, reason: str) -> None:
         self._terminate_process_tree(proc)
         self._record_block(proc, exe, reason)
-        self.logger.warning("process guard blocked | pid=%s name=%s exe=%s", proc.pid, proc.info.get("name"), exe)
+        self.logger.warning("process guard blocked | pid=%s name=%s exe=%s", proc.pid, self._process_info_value(proc, "name"), exe)
 
     def _terminate_process_tree(self, proc) -> None:
         try:
@@ -578,8 +626,8 @@ class ProcessGuard:
                     source="process_guard",
                 )
         self.database.record_block_event(
-            pid=proc.info.get("pid"),
-            process_name=proc.info.get("name"),
+            pid=self._process_info_value(proc, "pid"),
+            process_name=self._process_info_value(proc, "name"),
             exe_path=exe or None,
             sha256=sha256,
             reason=reason,
@@ -600,7 +648,7 @@ class ProcessGuard:
         self.logger.warning(
             "suspicious active process observed | pid=%s name=%s exe=%s reason=%s",
             proc.pid,
-            proc.info.get("name"),
+            self._process_info_value(proc, "name"),
             exe,
             reason,
         )

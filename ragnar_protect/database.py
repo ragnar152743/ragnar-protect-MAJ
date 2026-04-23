@@ -754,6 +754,16 @@ class Database:
                 values,
             )
 
+    def delete_watched_file(self, path: str, sha256: str) -> None:
+        with self._lock, self._managed_connection() as connection:
+            connection.execute(
+                """
+                DELETE FROM watched_files
+                WHERE path = ? AND sha256 = ?
+                """,
+                (path, sha256),
+            )
+
     def list_watched_files(self, active_only: bool = True, limit: int = 200) -> list[dict[str, Any]]:
         query = "SELECT * FROM watched_files"
         if active_only:

@@ -111,6 +111,18 @@ class ScannerTests(unittest.TestCase):
     def test_managed_path_recognizes_project_root(self) -> None:
         self.assertTrue(is_managed_path(PACKAGE_ROOT / "main.py"))
 
+    def test_managed_path_recognizes_ragnar_pyinstaller_mei_bundle(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            bundle_root = Path(temp_dir) / "_MEI99999"
+            (bundle_root / "native_helper").mkdir(parents=True)
+            bundle_file = bundle_root / "python3.dll"
+            bundle_file.write_text("placeholder", encoding="utf-8")
+            self.assertTrue(is_managed_path(bundle_file))
+
+    def test_managed_path_recognizes_legacy_ragnar_temp_sandbox(self) -> None:
+        legacy_path = Path(tempfile.gettempdir()) / "ragnar-native-sandbox" / "sample" / "work" / "evil.exe"
+        self.assertTrue(is_managed_path(legacy_path))
+
     def test_default_launch_opens_gui_when_no_cli_action_is_present(self) -> None:
         args = Namespace(
             scan=None,
@@ -202,6 +214,9 @@ class ScannerTests(unittest.TestCase):
             "register_background_worker",
         ) as register_mock, patch.object(
             cli,
+            "ensure_watchdog_worker",
+        ) as ensure_watchdog_mock, patch.object(
+            cli,
             "unregister_background_worker",
         ) as unregister_mock, patch.object(
             cli.time,
@@ -213,6 +228,7 @@ class ScannerTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         relaunch_mock.assert_not_called()
         register_mock.assert_called_once_with(reduced_mode=True)
+        ensure_watchdog_mock.assert_called_once_with()
         engine.start_protection.assert_called_once_with(reduced_mode=True)
         unregister_mock.assert_called_once()
 

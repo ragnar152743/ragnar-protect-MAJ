@@ -3,7 +3,14 @@ from __future__ import annotations
 import ctypes
 from pathlib import Path
 
-from .config import CANARY_ENABLED, CANARY_FILE_NAMES, CANARY_PROTECTED_DIRS
+from .config import (
+    CANARY_ENABLED,
+    CANARY_FILE_NAMES,
+    CANARY_MAX_DIRS_PER_ROOT,
+    CANARY_MAX_SUBDIR_DEPTH,
+    CANARY_PROTECTED_DIRS,
+    is_managed_path,
+)
 from .logging_setup import get_logger
 
 
@@ -22,7 +29,7 @@ class CanaryGuard:
             return []
         created: list[Path] = []
         self._canary_paths.clear()
-        for root in self.paths:
+        for root in self._iter_target_dirs():
             for file_name in CANARY_FILE_NAMES:
                 path = root / file_name
                 try:
@@ -39,6 +46,47 @@ class CanaryGuard:
         if self._canary_paths:
             self.logger.info("canary guard ready | count=%s", len(self._canary_paths))
         return created
+
+    def _iter_target_dirs(self) -> list[Path]:
+        targets: list[Path] = []
+        seen: set[str] = set()
+        for root in self.paths:
+            self._append_target_dir(root, targets, seen)
+            if CANARY_MAX_SUBDIR_DEPTH <= 0:
+                continue
+            queue: list[tuple[Path, int]] = [(root, 0)]
+            discovered = 0
+            while queue and discovered < CANARY_MAX_DIRS_PER_ROOT:
+                current, depth = queue.pop(0)
+                if depth >= CANARY_MAX_SUBDIR_DEPTH:
+                    continue
+                try:
+                    children = sorted((child for child in current.iterdir() if child.is_dir()), key=lambda item: item.name.lower())
+                except OSError:
+                    continue
+                for child in children:
+                    try:
+                        if is_managed_path(child):
+                            continue
+                    except Exception:
+                        continue
+                    if self._append_target_dir(child, targets, seen):
+                        discovered += 1
+                    queue.append((child, depth + 1))
+                    if discovered >= CANARY_MAX_DIRS_PER_ROOT:
+                        break
+        return targets
+
+    def _append_target_dir(self, path: Path, targets: list[Path], seen: set[str]) -> bool:
+        try:
+            resolved = str(path.resolve()).lower()
+        except OSError:
+            resolved = str(path).lower()
+        if resolved in seen:
+            return False
+        seen.add(resolved)
+        targets.append(path)
+        return True
 
     def list_canary_paths(self) -> list[str]:
         return sorted(self._canary_paths)

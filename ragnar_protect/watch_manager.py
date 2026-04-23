@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from .cloud_reputation import CloudReputationClient
-from .config import WATCH_AUTO_UNBLOCK_DAYS, WATCH_REQUIRED_CLEAN_SCANS
+from .config import WATCH_AUTO_UNBLOCK_DAYS, WATCH_REQUIRED_CLEAN_SCANS, is_managed_path
 from .database import Database
 from .logging_setup import get_logger
 from .models import BehaviorIncident, FileScanResult, WatchedFileState
@@ -35,6 +35,7 @@ class WatchManager:
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
             return
+        self._purge_managed_watch_entries()
         self._stop_event.clear()
         self._thread = threading.Thread(target=self._loop, name="RagnarWatchManager", daemon=True)
         self._thread.start()
@@ -55,6 +56,9 @@ class WatchManager:
     def handle_scan_result(self, result: FileScanResult) -> None:
         artifact_type = str(result.metadata.get("artifact_type", "file"))
         tracked_path = str(result.metadata.get("tracked_original_path") or result.path)
+        if is_managed_path(tracked_path) or is_managed_path(result.path):
+            self.database.delete_watched_file(tracked_path, result.sha256)
+            return
         if artifact_type != "file" and result.status == "clean":
             return
 
@@ -331,6 +335,14 @@ class WatchManager:
             self.logger.warning("destroyed confirmed malware quarantine copy | %s", quarantined_path)
         except OSError as exc:
             self.logger.warning("failed to destroy quarantine copy | %s | %s", quarantined_path, exc)
+
+    def _purge_managed_watch_entries(self) -> None:
+        for row in self.database.list_watched_files(active_only=False, limit=1000):
+            try:
+                if is_managed_path(str(row.get("path") or "")):
+                    self.database.delete_watched_file(str(row["path"]), str(row["sha256"]))
+            except Exception:
+                continue
 
     def _parse_dt(self, value: str) -> datetime | None:
         if not value:

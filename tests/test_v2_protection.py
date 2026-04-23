@@ -13,6 +13,7 @@ from unittest.mock import patch
 os.environ.setdefault("RAGNAR_APP_DIR", str(Path(tempfile.gettempdir()) / "ragnar-protect-tests"))
 
 from ragnar_protect.behavior_engine import BehaviorCorrelationEngine
+from ragnar_protect.canary_guard import CanaryGuard
 from ragnar_protect.cloud_reputation import CloudReputationClient
 from ragnar_protect.database import Database
 from ragnar_protect.hidden_process import _apply_hidden_windows_kwargs
@@ -376,6 +377,27 @@ class RagnarV2Tests(unittest.TestCase):
         self.assertFalse(self.db.is_hash_blocked("deadbeef"))
         self.assertGreaterEqual(self.db.count_pending_reputation_events(), 1)
 
+    def test_watch_manager_purges_managed_mei_entries(self) -> None:
+        watch_manager = WatchManager(self.db, self.fake_scanner, interval_seconds=1)
+        bundle_root = Path(self.temp_dir.name) / "_MEI77777"
+        (bundle_root / "native_helper").mkdir(parents=True)
+        managed_path = bundle_root / "python3.dll"
+        managed_path.write_text("placeholder", encoding="utf-8")
+        self.db.upsert_watched_file(
+            WatchedFileState(
+                path=str(managed_path),
+                sha256="managedhash",
+                status="under_watch",
+                reason="should be ignored",
+                last_verdict="suspicious",
+                metadata={},
+            )
+        )
+
+        watch_manager._purge_managed_watch_entries()
+
+        self.assertIsNone(self.db.get_watched_file(str(managed_path), "managedhash"))
+
     def test_cloud_client_rejects_secret_key(self) -> None:
         client = CloudReputationClient(
             lookup_url="https://example.com/lookup",
@@ -576,6 +598,24 @@ class RagnarV2Tests(unittest.TestCase):
             guard._inspect_process(proc, (proc.pid, proc.info["create_time"]), first_seen=False)
         block_mock.assert_called_once()
 
+    def test_process_guard_blocks_ragnar_tamper_command(self) -> None:
+        scanner = _FakeRansomToolScanner()
+        guard = ProcessGuard(scanner, self.db)
+        proc = _FakeSystemToolProc(
+            7878,
+            r"C:\Windows\System32\taskkill.exe",
+            "taskkill.exe",
+            [
+                r"C:\Windows\System32\taskkill.exe",
+                "/F",
+                "/IM",
+                "RagnarProtect.exe",
+            ],
+        )
+        with patch.object(guard, "_block_process_tree") as block_mock:
+            guard._inspect_process(proc, (proc.pid, proc.info["create_time"]), first_seen=False)
+        block_mock.assert_called_once()
+
     def test_process_guard_resumes_suspended_managed_process_when_preflight_is_skipped(self) -> None:
         scanner = _FakeLaunchScanner(
             FileScanResult(
@@ -596,6 +636,17 @@ class RagnarV2Tests(unittest.TestCase):
 
         self.assertEqual(action, "allow")
         self.assertTrue(proc.resumed)
+
+    def test_canary_guard_seeds_first_level_subdirectories(self) -> None:
+        root = Path(self.temp_dir.name) / "Documents"
+        subdir = root / "Projects"
+        subdir.mkdir(parents=True)
+        guard = CanaryGuard(paths=[root])
+
+        created = guard.ensure_canaries()
+
+        self.assertTrue(any(str(subdir).lower() in str(path).lower() for path in created))
+        self.assertTrue(any(guard.is_canary_path(path) for path in created))
 
 
 if __name__ == "__main__":

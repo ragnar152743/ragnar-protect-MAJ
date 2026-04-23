@@ -6,7 +6,7 @@ from pathlib import Path
 from tkinter import filedialog, ttk
 
 from .background_runtime import background_status, ensure_background_worker, stop_background_workers
-from .config import LOGO_ICON, LOGO_PNG
+from .config import LOGO_ICON, LOGO_PNG, is_managed_path
 from .engine import RagnarProtectEngine
 
 
@@ -477,6 +477,8 @@ class RagnarProtectApp(tk.Tk):
         for item in self.watch_tree.get_children():
             self.watch_tree.delete(item)
         for row in self.engine.database.list_watched_files(limit=200):
+            if is_managed_path(str(row.get("path") or "")):
+                continue
             self.watch_tree.insert(
                 "",
                 "end",

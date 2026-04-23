@@ -18,6 +18,8 @@ from .config import (
     BEHAVIOR_RENAME_WINDOW_SECONDS,
     BEHAVIOR_SENSITIVE_ZONE_THRESHOLD,
     HIGH_RISK_PROCESS_NAMES,
+    RANSOMWARE_EARLY_RENAME_THRESHOLD,
+    RANSOMWARE_HARD_KILL_RENAME_THRESHOLD,
     SENSITIVE_EXTENSIONS,
     SENSITIVE_ZONE_PATHS,
     USER_SPACE_HINTS,
@@ -171,7 +173,7 @@ class BehaviorCorrelationEngine:
             and modify_count < BEHAVIOR_MODIFY_THRESHOLD
             and create_count < BEHAVIOR_CREATE_THRESHOLD
             and ransomware_signals["ransom_note_count"] == 0
-            and ransomware_signals["encrypted_rename_count"] < 8
+            and ransomware_signals["encrypted_rename_count"] < RANSOMWARE_EARLY_RENAME_THRESHOLD
             and ransomware_signals["canary_event_count"] == 0
         ):
             return None
@@ -205,10 +207,10 @@ class BehaviorCorrelationEngine:
         if ransomware_signals["canary_event_count"] > 0:
             incident_type = "canary_trip"
             score += 90
-        if ransomware_signals["encrypted_rename_count"] >= 8:
+        if ransomware_signals["encrypted_rename_count"] >= RANSOMWARE_EARLY_RENAME_THRESHOLD:
             incident_type = "encrypted_rename_burst"
             score += 55
-        if ransomware_signals["dominant_encrypted_extension_count"] >= 8:
+        if ransomware_signals["dominant_encrypted_extension_count"] >= RANSOMWARE_EARLY_RENAME_THRESHOLD:
             score += 20
         if ransomware_signals["ransom_note_count"] > 0:
             incident_type = "ransom_note_burst"
@@ -230,7 +232,7 @@ class BehaviorCorrelationEngine:
                 or str(process_info.get("name", "")).lower() in HIGH_RISK_PROCESS_NAMES
             )
             and (
-                ransomware_signals["encrypted_rename_count"] >= 8
+                ransomware_signals["encrypted_rename_count"] >= RANSOMWARE_EARLY_RENAME_THRESHOLD
                 or ransomware_signals["ransom_note_count"] > 0
                 or ransomware_signals["canary_event_count"] > 0
             )
@@ -247,7 +249,7 @@ class BehaviorCorrelationEngine:
             effective_write_rate >= 1_500_000
             or (float(global_metrics.get("cpu_percent", 0.0)) >= 65 and effective_write_rate >= 250_000)
             or (float(global_metrics.get("disk_percent", 0.0)) >= 70 and effective_write_rate >= 250_000)
-            or ransomware_signals["encrypted_rename_count"] >= 12
+            or ransomware_signals["encrypted_rename_count"] >= RANSOMWARE_HARD_KILL_RENAME_THRESHOLD
             or ransomware_signals["ransom_note_count"] > 0
             or ransomware_signals["canary_event_count"] > 0
         )
@@ -256,14 +258,14 @@ class BehaviorCorrelationEngine:
             rename_count >= BEHAVIOR_RENAME_THRESHOLD
             or modify_count >= BEHAVIOR_MODIFY_THRESHOLD
             or (create_count >= BEHAVIOR_CREATE_THRESHOLD and len(sensitive_zones) >= BEHAVIOR_SENSITIVE_ZONE_THRESHOLD)
-            or ransomware_signals["encrypted_rename_count"] >= 8
+            or ransomware_signals["encrypted_rename_count"] >= RANSOMWARE_EARLY_RENAME_THRESHOLD
             or ransomware_signals["ransom_note_count"] > 0
             or ransomware_signals["canary_event_count"] > 0
         ):
             if (
                 causal
                 or rename_count >= BEHAVIOR_RENAME_THRESHOLD
-                or ransomware_signals["encrypted_rename_count"] >= 8
+                or ransomware_signals["encrypted_rename_count"] >= RANSOMWARE_EARLY_RENAME_THRESHOLD
                 or ransomware_signals["ransom_note_count"] > 0
                 or ransomware_signals["canary_event_count"] > 0
             ):
