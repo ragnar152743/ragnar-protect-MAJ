@@ -1,0 +1,98 @@
+[
+  {
+    "name": "powershell_encoded_command",
+    "score": 45,
+    "pattern": "(?i)(?:powershell|pwsh)(?:\\.exe)?\\s+.*(?:-enc|-encodedcommand)\\s+",
+    "description": "PowerShell encoded command execution"
+  },
+  {
+    "name": "memory_injection_api",
+    "score": 40,
+    "pattern": "(?i)\\b(CreateRemoteThread|VirtualAlloc(?:Ex)?|WriteProcessMemory|NtWriteVirtualMemory|NtCreateThreadEx)\\b",
+    "description": "Memory injection API reference"
+  },
+  {
+    "name": "download_and_exec",
+    "score": 25,
+    "pattern": "(?i)\\b(Invoke-WebRequest|DownloadString|WebClient|Start-BitsTransfer|curl(?:\\.exe)?|bitsadmin|certutil(?:\\.exe)?\\s+-urlcache)\\b",
+    "description": "Downloader behavior"
+  },
+  {
+    "name": "script_exec_chain",
+    "score": 20,
+    "pattern": "(?i)\\b(IEX|Invoke-Expression|mshta(?:\\.exe)?|rundll32(?:\\.exe)?|wscript(?:\\.exe)?|cscript(?:\\.exe)?|regsvr32(?:\\.exe)?)\\b",
+    "description": "Script execution chain"
+  },
+  {
+    "name": "registry_persistence",
+    "score": 30,
+    "pattern": "(?i)(CurrentVersion\\\\Run(?:Once)?|Winlogon\\\\Shell|Image File Execution Options|\\\\RunServices)\\b",
+    "description": "Persistence registry path"
+  },
+  {
+    "name": "wallpaper_modification",
+    "score": 20,
+    "pattern": "(?i)(SystemParametersInfo|Control Panel\\\\\\\\Desktop\\\\\\\\Wallpaper|HKCU:\\\\\\\\Control Panel\\\\\\\\Desktop)",
+    "description": "Wallpaper modification behavior"
+  },
+  {
+    "name": "dangerous_script_host",
+    "score": 25,
+    "pattern": "(?i)\\b(Add-Type|Reflection\\.Assembly|FromBase64String|EncodedCommand|ScheduledTask|schtasks)\\b",
+    "description": "Obfuscated or persistence-oriented script behavior"
+  },
+  {
+    "name": "defender_tamper",
+    "score": 35,
+    "pattern": "(?i)\\b(Set-MpPreference|Add-MpPreference|Remove-MpPreference|sc(?:\\.exe)?\\s+(?:stop|config)\\s+WinDefend)\\b",
+    "description": "Defender tampering attempt"
+  },
+  {
+    "name": "credential_dumping",
+    "score": 50,
+    "pattern": "(?i)\\b(comsvcs\\.dll.*MiniDump|procdump(?:64)?(?:\\.exe)?\\s+.*-ma\\s+lsass|sekurlsa|lsassy)\\b",
+    "description": "Credential dumping indicator"
+  },
+  {
+    "name": "scheduled_task_persistence",
+    "score": 30,
+    "pattern": "(?i)\\b(schtasks(?:\\.exe)?\\s+/(?:create|change)|New-ScheduledTask|Register-ScheduledTask)\\b",
+    "description": "Scheduled task persistence behavior"
+  },
+  {
+    "name": "shadow_copy_delete",
+    "score": 55,
+    "pattern": "(?i)\\b(vssadmin(?:\\.exe)?\\s+delete\\s+shadows|wmic(?:\\.exe)?\\s+shadowcopy\\s+(?:delete|call\\s+delete)|diskshadow(?:\\.exe)?\\b.*\\bdelete\\b.*\\bshadows\\b|Get-WmiObject\\s+Win32_ShadowCopy|Win32_ShadowCopy\\b.*Remove-WmiObject)\\b",
+    "description": "Shadow copy deletion or tampering"
+  },
+  {
+    "name": "backup_catalog_delete",
+    "score": 45,
+    "pattern": "(?i)\\b(wbadmin(?:\\.exe)?\\s+delete\\s+catalog|Remove-WBCatalog)\\b",
+    "description": "Backup catalog deletion"
+  },
+  {
+    "name": "recovery_impairment",
+    "score": 45,
+    "pattern": "(?i)\\b(bcdedit(?:\\.exe)?\\s+/set\\s+\\{default\\}\\s+recoveryenabled\\s+no|bcdedit(?:\\.exe)?\\s+/set\\s+\\{default\\}\\s+bootstatuspolicy\\s+ignoreallfailures|reagentc(?:\\.exe)?\\s+/disable)\\b",
+    "description": "Recovery environment impairment"
+  },
+  {
+    "name": "event_log_clear",
+    "score": 35,
+    "pattern": "(?i)\\b(wevtutil(?:\\.exe)?\\s+cl\\s+|Clear-EventLog\\b|Remove-EventLog\\b)\\b",
+    "description": "Event log clearing"
+  },
+  {
+    "name": "cipher_wipe",
+    "score": 30,
+    "pattern": "(?i)\\b(cipher(?:\\.exe)?\\s+/w:)\\b",
+    "description": "Free-space wipe command"
+  },
+  {
+    "name": "ransomware_note_phrase",
+    "score": 35,
+    "pattern": "(?i)(your\\s+files\\s+(?:have\\s+been|are)\\s+encrypted|how[_ -]?to[_ -]?decrypt|restore[_ -]?my[_ -]?files|recover[_ -]?files|decrypt\\s+instructions|bitcoin\\s+wallet|private\\s+key)",
+    "description": "Ransom note language"
+  }
+]

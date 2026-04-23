@@ -1,0 +1,5 @@
+pefile>=2023.2.7
+psutil>=6.1.0
+requests>=2.32.0
+watchdog>=6.0.0
+yara-python>=4.5.4
