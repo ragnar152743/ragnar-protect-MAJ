@@ -4,7 +4,7 @@
   "channel": "stable",
   "version": "2.2.0",
   "asset_name": "RagnarProtect.exe",
-  "size": 20795384,
-  "sha256": "f7667c441b6f110269b1533e891d26a294d53aeb70f29577642f6aeb61cd2156",
+  "size": 51886416,
+  "sha256": "8ebfbc591f11186cd58f62aac58746d20b2d85e73ff75cd842eb19a0a10626f1",
   "exe_url": "https://raw.githubusercontent.com/ragnar152743/ragnar-protect-MAJ/main/RagnarProtect.exe"
 }
