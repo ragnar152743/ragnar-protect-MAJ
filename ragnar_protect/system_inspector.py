@@ -8,11 +8,13 @@ from pathlib import Path
 
 from .config import (
     ARCHIVE_EXTENSIONS,
+    BOOT_PREFLIGHT_MAX_WINDOWS_FILES,
     DEFAULT_MONITORED_DIRS,
     HIGH_RISK_PROCESS_NAMES,
     ROLLBACK_PROTECTED_EXTENSIONS,
     SENSITIVE_EXTENSIONS,
     STARTUP_DIRS,
+    TEMP_DIR,
     USER_SPACE_HINTS,
     is_managed_path,
 )
@@ -61,10 +63,34 @@ class SystemInspector:
         return results
 
     def scan_hotspots(self, max_files_per_dir: int = 40) -> list:
+        return self._scan_roots(
+            [path for path in [*DEFAULT_MONITORED_DIRS, *STARTUP_DIRS] if path.exists()],
+            max_files_per_dir=max_files_per_dir,
+        )
+
+    def scan_boot_hotspots(self, max_files_per_dir: int = 40) -> list:
+        roots = [
+            path
+            for path in [*STARTUP_DIRS, *DEFAULT_MONITORED_DIRS]
+            if path.exists() and path != TEMP_DIR
+        ]
+        roots.extend(self._all_profile_hotspot_roots())
+        return self._scan_roots(roots, max_files_per_dir=max_files_per_dir)
+
+    def _scan_roots(self, roots: list[Path], max_files_per_dir: int) -> list:
+        deduped_roots: list[Path] = []
+        seen_roots: set[str] = set()
+        for root in roots:
+            try:
+                normalized = str(root.resolve()).lower()
+            except OSError:
+                normalized = str(root).lower()
+            if normalized in seen_roots:
+                continue
+            seen_roots.add(normalized)
+            deduped_roots.append(root)
         roots = []
-        for path in [*DEFAULT_MONITORED_DIRS, *STARTUP_DIRS]:
-            if path.exists():
-                roots.append(path)
+        roots.extend(deduped_roots)
         results = []
         for root in roots:
             candidates = sorted(
@@ -96,7 +122,7 @@ class SystemInspector:
                 results.append(executable_result)
         return results
 
-    def scan_startup_entries(self) -> list:
+    def scan_startup_entries(self, remediate: bool = False) -> list:
         results = []
         scanned_targets: set[str] = set()
         for entry in self._get_startup_entries():
@@ -119,13 +145,13 @@ class SystemInspector:
             )
             if artifact.status != "clean":
                 results.append(artifact)
+                if remediate and artifact.status == "malicious":
+                    self._remediate_startup_entry(entry, "malicious startup command artifact")
             for candidate_path in self._extract_candidate_paths(command):
                 normalized = str(candidate_path).lower()
                 if (
-                    artifact.status == "clean"
-                    or normalized in scanned_targets
+                    normalized in scanned_targets
                     or not candidate_path.exists()
-                    or not self._is_user_space_path(str(candidate_path))
                     or is_managed_path(candidate_path)
                 ):
                     continue
@@ -133,9 +159,12 @@ class SystemInspector:
                 file_result = self.scanner.scan_file(candidate_path)
                 if file_result.status != "clean":
                     results.append(file_result)
+                if remediate and file_result.status == "malicious":
+                    self._remediate_startup_entry(entry, "malicious startup executable")
+                    self.scanner.enforce_block_on_existing_file(candidate_path, file_result)
         return results
 
-    def scan_scheduled_tasks(self) -> list:
+    def scan_scheduled_tasks(self, remediate: bool = False) -> list:
         results = []
         scanned_targets: set[str] = set()
         for task in self._get_scheduled_tasks():
@@ -162,13 +191,13 @@ class SystemInspector:
             )
             if artifact.status != "clean":
                 results.append(artifact)
+                if remediate and artifact.status == "malicious":
+                    self._remediate_scheduled_task(task, "malicious scheduled task artifact")
             for candidate_path in self._extract_candidate_paths(command):
                 normalized = str(candidate_path).lower()
                 if (
-                    artifact.status == "clean"
-                    or normalized in scanned_targets
+                    normalized in scanned_targets
                     or not candidate_path.exists()
-                    or not self._is_user_space_path(str(candidate_path))
                     or is_managed_path(candidate_path)
                 ):
                     continue
@@ -176,6 +205,44 @@ class SystemInspector:
                 file_result = self.scanner.scan_file(candidate_path)
                 if file_result.status != "clean":
                     results.append(file_result)
+                if remediate and file_result.status == "malicious":
+                    self._remediate_scheduled_task(task, "malicious scheduled task executable")
+                    self.scanner.enforce_block_on_existing_file(candidate_path, file_result)
+        return results
+
+    def scan_windows_boot_surface(self, max_files: int = BOOT_PREFLIGHT_MAX_WINDOWS_FILES) -> list:
+        system_root = Path(os.getenv("SystemRoot", r"C:\Windows"))
+        roots = [
+            system_root / "System32" / "Tasks",
+            system_root / "System32" / "drivers",
+            system_root / "System32",
+            system_root / "SysWOW64",
+        ]
+        candidates: list[Path] = []
+        seen: set[str] = set()
+        for root in roots:
+            if not root.exists():
+                continue
+            for candidate in self._iter_interesting_files(root, max_depth=2):
+                try:
+                    normalized = str(candidate.resolve()).lower()
+                except OSError:
+                    continue
+                if normalized in seen:
+                    continue
+                seen.add(normalized)
+                candidates.append(candidate)
+        candidates = sorted(
+            candidates,
+            key=lambda item: item.stat().st_mtime if item.exists() else 0,
+            reverse=True,
+        )[:max_files]
+        results = []
+        for candidate in candidates:
+            try:
+                results.append(self.scanner.scan_file(candidate))
+            except Exception as exc:
+                self.logger.exception("windows boot surface scan failed | %s | %s", candidate, exc)
         return results
 
     def _inspect_process(
@@ -277,6 +344,49 @@ class SystemInspector:
                 continue
         return items
 
+    def _remediate_startup_entry(self, entry: dict[str, object], reason: str) -> None:
+        name = str(entry.get("name", "")).strip()
+        if not name:
+            return
+        locations = [
+            (r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run", "HKCU Run"),
+            (r"HKCU\Software\Microsoft\Windows\CurrentVersion\RunOnce", "HKCU RunOnce"),
+            (r"HKLM\Software\Microsoft\Windows\CurrentVersion\Run", "HKLM Run"),
+            (r"HKLM\Software\Microsoft\Windows\CurrentVersion\RunOnce", "HKLM RunOnce"),
+        ]
+        location_hint = str(entry.get("location", "")).strip()
+        removed = False
+        for registry_path, label in locations:
+            if location_hint and label not in location_hint and registry_path not in location_hint:
+                continue
+            completed = run_hidden(
+                ["reg.exe", "delete", registry_path, "/v", name, "/f"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+            if completed.returncode == 0:
+                removed = True
+        if removed:
+            self.logger.warning("startup entry removed | name=%s reason=%s", name, reason)
+
+    def _remediate_scheduled_task(self, task: dict[str, object], reason: str) -> None:
+        task_name = str(task.get("task_name", "")).strip()
+        task_path = str(task.get("task_path", "")).strip()
+        if not task_name:
+            return
+        full_name = f"{task_path}{task_name}" if task_path else task_name
+        completed = run_hidden(
+            ["schtasks", "/change", "/tn", full_name, "/disable"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        if completed.returncode == 0:
+            self.logger.warning("scheduled task disabled | task=%s reason=%s", full_name, reason)
+
     def _get_scheduled_tasks(self) -> list[dict[str, object]]:
         command = (
             "Get-ScheduledTask | ForEach-Object { "
@@ -362,7 +472,35 @@ class SystemInspector:
         extension = path.suffix.lower()
         if extension in SENSITIVE_EXTENSIONS or extension in ARCHIVE_EXTENSIONS or extension in ROLLBACK_PROTECTED_EXTENSIONS:
             return True
+        if extension in {".com", ".cpl", ".ocx", ".job", ".efi"}:
+            return True
+        lowered_parts = [part.lower() for part in path.parts]
+        if "system32" in lowered_parts and "tasks" in lowered_parts and not extension:
+            return True
         return False
+
+    def _all_profile_hotspot_roots(self) -> list[Path]:
+        profiles_root = Path(os.getenv("SystemDrive", "C:")) / "Users"
+        if not profiles_root.exists():
+            return []
+        roots: list[Path] = []
+        ignored = {"default", "default user", "all users"}
+        for profile in profiles_root.iterdir():
+            if not profile.is_dir():
+                continue
+            lowered = profile.name.lower()
+            if lowered in ignored or lowered.startswith("default"):
+                continue
+            candidates = [
+                profile / "Desktop",
+                profile / "Downloads",
+                profile / "Documents",
+                profile / "AppData" / "Roaming" / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup",
+            ]
+            for candidate in candidates:
+                if candidate.exists():
+                    roots.append(candidate)
+        return roots
 
     def _extract_candidate_paths(self, command: str) -> list[Path]:
         expanded = os.path.expandvars(command.strip().strip('"'))

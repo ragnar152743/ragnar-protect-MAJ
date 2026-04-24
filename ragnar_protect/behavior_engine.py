@@ -36,12 +36,13 @@ except Exception:  # pragma: no cover
 
 
 class BehaviorCorrelationEngine:
-    def __init__(self, scanner, database: Database, watch_manager=None, canary_guard=None, rollback_cache=None) -> None:
+    def __init__(self, scanner, database: Database, watch_manager=None, canary_guard=None, rollback_cache=None, taskbar_guard=None) -> None:
         self.scanner = scanner
         self.database = database
         self.watch_manager = watch_manager
         self.canary_guard = canary_guard
         self.rollback_cache = rollback_cache
+        self.taskbar_guard = taskbar_guard
         self.logger = get_logger("ragnar_protect.behavior")
         self._queue: Queue[dict[str, Any]] = Queue()
         self._thread: threading.Thread | None = None
@@ -351,10 +352,23 @@ class BehaviorCorrelationEngine:
             reason=f"Behavior correlation: {incident.reason}",
         )
         restored_paths: list[str] = []
+        removed_artifacts: list[str] = []
         if self.rollback_cache is not None:
             restored_paths = self.rollback_cache.restore_paths(incident.paths, incident.reason)
             if restored_paths:
                 self.logger.warning("rollback restored %s path(s) after incident", len(restored_paths))
+            ransomware_signals = incident.metadata.get("ransomware_signals", {}) if isinstance(incident.metadata, dict) else {}
+            cleanup_candidates = list(ransomware_signals.get("encrypted_paths", [])) + list(ransomware_signals.get("ransom_note_paths", []))
+            removed_artifacts = self.rollback_cache.purge_artifacts(cleanup_candidates, incident.reason)
+            if removed_artifacts:
+                self.logger.warning("rollback cleanup removed %s encrypted artifact(s)", len(removed_artifacts))
+        if self.taskbar_guard is not None:
+            ransomware_signals = incident.metadata.get("ransomware_signals", {}) if isinstance(incident.metadata, dict) else {}
+            if restored_paths or removed_artifacts or ransomware_signals.get("ransom_note_count", 0):
+                try:
+                    self.taskbar_guard.restore_snapshot(incident.reason)
+                except Exception as exc:
+                    self.logger.warning("taskbar restore failed | %s", exc)
         for touched_path in incident.paths[:8]:
             candidate = Path(touched_path)
             if not candidate.exists() or candidate.suffix.lower() not in SENSITIVE_EXTENSIONS:
@@ -533,6 +547,8 @@ class BehaviorCorrelationEngine:
         touched_parents: set[str] = set()
         canary_event_count = 0
         canary_paths: set[str] = set()
+        encrypted_paths: list[str] = []
+        ransom_note_paths: list[str] = []
 
         for item in self._rename_events:
             src_path = Path(str(item.get("src_path") or item["path"]))
@@ -543,6 +559,7 @@ class BehaviorCorrelationEngine:
             if self._looks_encrypted_rename(src_path, dest_path):
                 encrypted_rename_count += 1
                 encrypted_extension_counts[dest_path.suffix.lower()] = encrypted_extension_counts.get(dest_path.suffix.lower(), 0) + 1
+                encrypted_paths.append(str(dest_path))
             touched_parents.add(str(dest_path.parent).lower())
 
         for item in self._create_events:
@@ -553,6 +570,7 @@ class BehaviorCorrelationEngine:
                 canary_paths.add(str(created_path))
             if self._is_ransom_note_name(created_path.name):
                 ransom_note_count += 1
+                ransom_note_paths.append(str(created_path))
 
         for item in self._modify_events:
             modified_path = Path(str(item.get("path") or ""))
@@ -575,6 +593,8 @@ class BehaviorCorrelationEngine:
             "dominant_encrypted_extension": dominant_encrypted_extension,
             "dominant_encrypted_extension_count": dominant_encrypted_extension_count,
             "ransom_note_count": ransom_note_count,
+            "encrypted_paths": encrypted_paths[-40:],
+            "ransom_note_paths": ransom_note_paths[-20:],
             "unique_touched_parent_count": len(touched_parents),
             "canary_event_count": canary_event_count,
             "canary_paths": sorted(canary_paths),

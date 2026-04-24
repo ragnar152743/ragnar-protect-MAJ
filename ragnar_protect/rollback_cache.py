@@ -89,6 +89,23 @@ class RollbackCache:
                 self.logger.warning("rollback restore failed | %s | %s", original, exc)
         return restored
 
+    def purge_artifacts(self, paths: list[str], incident_reason: str) -> list[str]:
+        removed: list[str] = []
+        seen: set[str] = set()
+        for value in paths:
+            candidate = Path(value)
+            normalized = str(candidate).lower()
+            if normalized in seen or not candidate.exists() or not candidate.is_file():
+                continue
+            seen.add(normalized)
+            try:
+                candidate.unlink()
+                removed.append(str(candidate))
+                self.logger.warning("rollback cleanup removed | %s | reason=%s", candidate, incident_reason)
+            except OSError as exc:
+                self.logger.warning("rollback cleanup failed | %s | %s", candidate, exc)
+        return removed
+
     def status(self) -> dict[str, object]:
         total_size = 0
         count = 0

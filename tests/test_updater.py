@@ -132,7 +132,7 @@ class UpdaterTests(unittest.TestCase):
             manifest_payload = base64.b64encode(
                 (
                     "{"
-                    "\"version\":\"2.2.2\","
+                    "\"version\":\"2.3.1\","
                     f"\"sha256\":\"{new_hash}\","
                     f"\"size\":{len(new_payload)},"
                     "\"asset_name\":\"RagnarProtect.exe\","
@@ -170,6 +170,54 @@ class UpdaterTests(unittest.TestCase):
             self.assertEqual(result["state"], "update_applying")
             self.assertTrue(result["apply_started"])
             apply_mock.assert_called_once()
+
+    def test_same_version_hash_mismatch_does_not_auto_apply(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            updates_dir = Path(temp_dir) / "updates"
+            updates_dir.mkdir()
+            current_exe = Path(temp_dir) / "RagnarProtect.exe"
+            current_exe.write_bytes(b"local-dev-binary")
+            remote_payload = b"published-binary"
+            remote_hash = hashlib.sha256(remote_payload).hexdigest()
+            manifest_api_url = "https://api.github.com/repos/ragnar152743/ragnar-protect-MAJ/contents/manifest.json?ref=main"
+            exe_url = "https://raw.githubusercontent.com/ragnar152743/ragnar-protect-MAJ/main/RagnarProtect.exe"
+            manifest_payload = base64.b64encode(
+                (
+                    "{"
+                    f"\"version\":\"{APP_VERSION}\","
+                    f"\"sha256\":\"{remote_hash}\","
+                    f"\"size\":{len(remote_payload)},"
+                    "\"asset_name\":\"RagnarProtect.exe\","
+                    f"\"exe_url\":\"{exe_url}\""
+                    "}"
+                ).encode("utf-8")
+            ).decode("ascii")
+            session = _FakeSession(
+                {
+                    manifest_api_url: _FakeResponse(
+                        json_payload={
+                            "encoding": "base64",
+                            "content": manifest_payload,
+                        }
+                    ),
+                    exe_url: _FakeResponse(content=remote_payload),
+                }
+            )
+            with patch("ragnar_protect.updater.UPDATES_DIR", updates_dir):
+                updater = GitHubUpdateManager(current_executable_path=current_exe, session=session)
+                with patch("ragnar_protect.updater.sys.frozen", True, create=True), patch(
+                    "ragnar_protect.updater.sys.executable",
+                    str(current_exe),
+                ), patch.object(
+                    updater,
+                    "apply_staged_update",
+                    return_value={"state": "update_applying", "apply_started": True},
+                ) as apply_mock:
+                    result = updater.check_now(auto_download=True, auto_apply=True)
+
+            self.assertEqual(result["state"], "update_staged")
+            self.assertFalse(result["apply_started"])
+            apply_mock.assert_not_called()
 
     def test_collect_managed_processes_does_not_capture_current_pid_for_other_executable(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

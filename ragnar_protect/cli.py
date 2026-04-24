@@ -5,10 +5,10 @@ import os
 import time
 
 from .background_runtime import ensure_watchdog_worker, register_background_worker, run_watchdog_loop, unregister_background_worker, unregister_watchdog_worker
-from .config import APP_DIR, ensure_app_dirs
+from .config import APP_DIR, BOOT_PREFLIGHT_HOLD_SECONDS, ensure_app_dirs
 from .engine import RagnarProtectEngine
 from .gui import RagnarProtectApp
-from .startup_manager import TASK_NAME, install_startup_task, is_admin, relaunch_as_admin, remove_startup_task, startup_task_exists
+from .startup_manager import TASK_NAMES, install_startup_task, is_admin, relaunch_as_admin, remove_startup_task, startup_task_exists
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -18,6 +18,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--prepare-exe-sandbox", help="Prepare a local isolated execution bundle for an executable")
     parser.add_argument("--launch-exe-sandbox", help="Prepare and launch a local isolated execution for an executable")
     parser.add_argument("--protect", action="store_true", help="Run background protection until interrupted")
+    parser.add_argument("--boot-preflight", action="store_true", help="Run early startup preflight scans and sandbox pending items")
     parser.add_argument("--gui", action="store_true", help="Open the graphical interface explicitly")
     parser.add_argument(
         "--allow-reduced-mode",
@@ -55,6 +56,7 @@ def _has_explicit_cli_action(args: argparse.Namespace) -> bool:
             args.prepare_exe_sandbox,
             args.launch_exe_sandbox,
             args.protect,
+            getattr(args, "boot_preflight", False),
             getattr(args, "watchdog", False),
             args.install_startup,
             args.remove_startup,
@@ -123,6 +125,17 @@ def main() -> int:
             unregister_watchdog_worker(expected_pid=os.getpid())
         return 0
 
+    if getattr(args, "boot_preflight", False):
+        report = engine.boot_preflight()
+        for key, value in report.items():
+            _emit_output(f"{key}: {value}")
+        try:
+            engine.start_protection(reduced_mode=not is_admin())
+            time.sleep(BOOT_PREFLIGHT_HOLD_SECONDS)
+        finally:
+            engine.stop_protection()
+        return 0
+
     if args.install_startup:
         if not is_admin():
             if relaunch_as_admin(["--install-startup", "--nogui"]):
@@ -130,7 +143,7 @@ def main() -> int:
             _emit_output("Elevation failed or was cancelled.")
             return 1
         result = install_startup_task()
-        _emit_output(f"Task: {result['task_name']}")
+        _emit_output(f"Tasks: {', '.join(result.get('task_names', []))}")
         _emit_output(f"Command: {result['launch_command']}")
         if result["success"]:
             _emit_output("Startup task installed.")
@@ -145,7 +158,7 @@ def main() -> int:
             _emit_output("Elevation failed or was cancelled.")
             return 1
         result = remove_startup_task()
-        _emit_output(f"Task: {TASK_NAME}")
+        _emit_output(f"Tasks: {', '.join(TASK_NAMES)}")
         if result["success"]:
             _emit_output("Startup task removed.")
             return 0

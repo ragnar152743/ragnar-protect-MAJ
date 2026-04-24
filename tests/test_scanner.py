@@ -156,6 +156,7 @@ class ScannerTests(unittest.TestCase):
             prepare_exe_sandbox=None,
             launch_exe_sandbox=None,
             protect=False,
+            boot_preflight=False,
             gui=False,
             allow_reduced_mode=False,
             install_startup=False,
@@ -182,6 +183,7 @@ class ScannerTests(unittest.TestCase):
             prepare_exe_sandbox=None,
             launch_exe_sandbox=None,
             protect=True,
+            boot_preflight=False,
             gui=False,
             allow_reduced_mode=True,
             install_startup=False,
@@ -231,6 +233,33 @@ class ScannerTests(unittest.TestCase):
         ensure_watchdog_mock.assert_called_once_with()
         engine.start_protection.assert_called_once_with(reduced_mode=True)
         unregister_mock.assert_called_once()
+
+    def test_boot_preflight_counts_as_explicit_action(self) -> None:
+        args = Namespace(
+            scan=None,
+            scan_executables=None,
+            prepare_exe_sandbox=None,
+            launch_exe_sandbox=None,
+            protect=False,
+            boot_preflight=True,
+            gui=False,
+            allow_reduced_mode=False,
+            install_startup=False,
+            remove_startup=False,
+            quick_scan=False,
+            system_audit=False,
+            cloud_status=False,
+            protection_status=False,
+            error_report_status=False,
+            check_updates=False,
+            update_status=False,
+            list_quarantine=False,
+            restore_quarantine=None,
+            benchmark=None,
+            monitor_seconds=0,
+            nogui=False,
+        )
+        self.assertFalse(cli._should_launch_gui(args))
 
 
 if __name__ == "__main__":

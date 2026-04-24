@@ -367,16 +367,23 @@ internal static class SandboxRunner
         var copiedSample = Path.Combine(workDir, sampleName);
         File.Copy(sample, copiedSample, overwrite: true);
 
-        var runKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
-        var startupDir = Environment.GetFolderPath(Environment.SpecialFolder.Startup);
-        var beforeRunKeys = SnapshotRunKeys(runKey);
-        var beforeStartup = SnapshotDirectory(startupDir);
+        var runKeys = new[]
+        {
+            @"Software\Microsoft\Windows\CurrentVersion\Run",
+            @"Software\Microsoft\Windows\CurrentVersion\RunOnce",
+        };
+        var startupDirs = BuildStartupDirectories();
+        var beforeRunKeys = SnapshotRunKeys(runKeys);
+        var beforeStartup = SnapshotDirectories(startupDirs);
         var beforeWallpaper = ReadWallpaper();
         var beforeFiles = SnapshotDirectory(workDir);
+        var monitoredDirs = BuildMonitoredDirectories(startupDirs);
+        var beforeExternal = SnapshotDirectories(monitoredDirs);
         var observedProcessNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var backend = "job-object-fallback";
-        var launch = LaunchRestrictedOrFallback(copiedSample, workDir);
-        backend = launch.Backend;
+        var firewallIsolation = ApplyFirewallIsolation(copiedSample);
+        var launch = LaunchRestrictedOrFallback(copiedSample, workDir, mode);
+        backend = firewallIsolation.Applied ? $"{launch.Backend}+firewall" : launch.Backend;
         var childCount = 0;
         var processStarted = launch.ProcessId > 0;
         string? launchError = launch.Error;
@@ -391,14 +398,17 @@ internal static class SandboxRunner
         finally
         {
             launch.Dispose();
+            RemoveFirewallIsolation(firewallIsolation);
         }
-        var afterRunKeys = SnapshotRunKeys(runKey);
-        var afterStartup = SnapshotDirectory(startupDir);
+        var afterRunKeys = SnapshotRunKeys(runKeys);
+        var afterStartup = SnapshotDirectories(startupDirs);
         var afterWallpaper = ReadWallpaper();
         var afterFiles = SnapshotDirectory(workDir);
+        var afterExternal = SnapshotDirectories(monitoredDirs);
         var droppedFiles = afterFiles.Keys.Where(path => !beforeFiles.ContainsKey(path)).ToList();
         var droppedExecutables = droppedFiles.Where(path => IsExecutableLike(path)).ToList();
         var startupDrops = afterStartup.Keys.Where(path => !beforeStartup.ContainsKey(path)).ToList();
+        var externalDrops = afterExternal.Keys.Where(path => !beforeExternal.ContainsKey(path)).ToList();
         var runKeyChanges = afterRunKeys.Except(beforeRunKeys, StringComparer.OrdinalIgnoreCase).ToList();
         var wallpaperChanged = !string.Equals(beforeWallpaper, afterWallpaper, StringComparison.OrdinalIgnoreCase);
         var destructiveToolSeen = observedProcessNames.Any(name => SuspiciousToolSeen(name));
@@ -407,7 +417,7 @@ internal static class SandboxRunner
         {
             verdict = "unknown";
         }
-        else if (childCount > 0 || droppedExecutables.Count > 0 || startupDrops.Count > 0 || runKeyChanges.Count > 0 || wallpaperChanged || destructiveToolSeen)
+        else if (childCount > 0 || droppedExecutables.Count > 0 || startupDrops.Count > 0 || externalDrops.Count > 0 || runKeyChanges.Count > 0 || wallpaperChanged || destructiveToolSeen)
         {
             verdict = "malicious";
         }
@@ -433,9 +443,13 @@ internal static class SandboxRunner
             droppedFiles,
             droppedExecutableCount = droppedExecutables.Count,
             startupDropCount = startupDrops.Count,
+            externalDropCount = externalDrops.Count,
+            externalDrops,
             runKeyChangeCount = runKeyChanges.Count,
             wallpaperChanged,
             destructiveToolSeen,
+            firewallIsolated = firewallIsolation.Applied,
+            firewallRuleErrors = firewallIsolation.Errors,
             sessionRoot,
             workDir,
             logsDir,
@@ -447,17 +461,17 @@ internal static class SandboxRunner
         return report;
     }
 
-    private static LaunchContext LaunchRestrictedOrFallback(string copiedSample, string workDir)
+    private static LaunchContext LaunchRestrictedOrFallback(string copiedSample, string workDir, string mode)
     {
-        var restricted = TryLaunchRestricted(copiedSample, workDir);
+        var restricted = TryLaunchRestricted(copiedSample, workDir, mode);
         if (restricted.ProcessId > 0)
         {
             return restricted;
         }
-        return TryLaunchWithJob(copiedSample, workDir, "job-object-fallback", restricted.Error);
+        return TryLaunchWithJob(copiedSample, workDir, "job-object-fallback", mode, restricted.Error);
     }
 
-    private static LaunchContext TryLaunchRestricted(string executablePath, string workDir)
+    private static LaunchContext TryLaunchRestricted(string executablePath, string workDir, string mode)
     {
         try
         {
@@ -471,7 +485,7 @@ internal static class SandboxRunner
                 throw new Win32Exception(Marshal.GetLastWin32Error());
             }
             using var restrictedHandle = new SafeHandleWrapper(restrictedToken);
-            return CreateProcessInJob(executablePath, workDir, restrictedToken, "restricted-token");
+            return CreateProcessInJob(executablePath, workDir, restrictedToken, "restricted-token", mode);
         }
         catch (Exception exc)
         {
@@ -479,11 +493,11 @@ internal static class SandboxRunner
         }
     }
 
-    private static LaunchContext TryLaunchWithJob(string executablePath, string workDir, string backend, string? priorError)
+    private static LaunchContext TryLaunchWithJob(string executablePath, string workDir, string backend, string mode, string? priorError)
     {
         try
         {
-            return CreateProcessInJob(executablePath, workDir, IntPtr.Zero, backend, priorError);
+            return CreateProcessInJob(executablePath, workDir, IntPtr.Zero, backend, mode, priorError);
         }
         catch (Exception exc)
         {
@@ -491,7 +505,7 @@ internal static class SandboxRunner
         }
     }
 
-    private static LaunchContext CreateProcessInJob(string executablePath, string workDir, IntPtr token, string backend, string? priorError = null)
+    private static LaunchContext CreateProcessInJob(string executablePath, string workDir, IntPtr token, string backend, string mode, string? priorError = null)
     {
         var startupInfo = new NativeMethods.STARTUPINFO();
         startupInfo.cb = Marshal.SizeOf<NativeMethods.STARTUPINFO>();
@@ -507,6 +521,9 @@ internal static class SandboxRunner
             throw new Win32Exception(Marshal.GetLastWin32Error());
         }
 
+        var deepMode = string.Equals(mode, "deep", StringComparison.OrdinalIgnoreCase);
+        var activeProcessLimit = deepMode ? 12u : 6u;
+        var processMemoryLimit = deepMode ? 768UL * 1024 * 1024 : 384UL * 1024 * 1024;
         var job = NativeMethods.CreateJobObject(IntPtr.Zero, null);
         if (job == IntPtr.Zero)
         {
@@ -517,7 +534,11 @@ internal static class SandboxRunner
             BasicLimitInformation = new NativeMethods.JOBOBJECT_BASIC_LIMIT_INFORMATION
             {
                 LimitFlags = NativeMethods.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-            }
+                    | NativeMethods.JOB_OBJECT_LIMIT_ACTIVE_PROCESS
+                    | NativeMethods.JOB_OBJECT_LIMIT_PROCESS_MEMORY,
+                ActiveProcessLimit = activeProcessLimit
+            },
+            ProcessMemoryLimit = (UIntPtr)processMemoryLimit
         };
         var length = Marshal.SizeOf<NativeMethods.JOBOBJECT_EXTENDED_LIMIT_INFORMATION>();
         var memory = Marshal.AllocHGlobal(length);
@@ -552,15 +573,18 @@ internal static class SandboxRunner
     private static int MonitorProcess(int processId, int timeoutSeconds, HashSet<string> observedProcessNames)
     {
         var deadline = DateTime.UtcNow.AddSeconds(Math.Max(3, timeoutSeconds));
+        var observedChildren = new HashSet<int>();
         while (DateTime.UtcNow < deadline)
         {
             try
             {
                 using var process = Process.GetProcessById(processId);
                 observedProcessNames.Add(process.ProcessName + ".exe");
-                foreach (var child in FindChildren(processId))
+                foreach (var child in FindDescendants(processId))
                 {
                     observedProcessNames.Add(child.ProcessName + ".exe");
+                    observedChildren.Add(child.Id);
+                    child.Dispose();
                 }
                 if (process.HasExited)
                 {
@@ -573,10 +597,39 @@ internal static class SandboxRunner
             }
             Thread.Sleep(400);
         }
-        return FindChildren(processId).Count;
+        foreach (var child in FindDescendants(processId))
+        {
+            observedChildren.Add(child.Id);
+            child.Dispose();
+        }
+        return observedChildren.Count;
     }
 
-    private static List<Process> FindChildren(int parentPid)
+    private static List<Process> FindDescendants(int parentPid)
+    {
+        var result = new List<Process>();
+        var pending = new Queue<int>();
+        var seen = new HashSet<int>();
+        pending.Enqueue(parentPid);
+        seen.Add(parentPid);
+        while (pending.Count > 0)
+        {
+            var currentParent = pending.Dequeue();
+            foreach (var child in FindDirectChildren(currentParent))
+            {
+                if (!seen.Add(child.Id))
+                {
+                    child.Dispose();
+                    continue;
+                }
+                result.Add(child);
+                pending.Enqueue(child.Id);
+            }
+        }
+        return result;
+    }
+
+    private static List<Process> FindDirectChildren(int parentPid)
     {
         var result = new List<Process>();
         try
@@ -602,6 +655,106 @@ internal static class SandboxRunner
         {
         }
         return result;
+    }
+
+    private static Dictionary<string, long> SnapshotDirectories(IEnumerable<string> directories)
+    {
+        var result = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
+        foreach (var directory in directories)
+        {
+            foreach (var entry in SnapshotDirectory(directory))
+            {
+                result[entry.Key] = entry.Value;
+            }
+        }
+        return result;
+    }
+
+    private static List<string> BuildMonitoredDirectories(IEnumerable<string> startupDirs)
+    {
+        var paths = new List<string>();
+        var desktop = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory);
+        var documents = Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments);
+        var profile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        var downloads = Path.Combine(profile, "Downloads");
+        var roaming = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
+        var local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        var systemRoot = Environment.GetFolderPath(Environment.SpecialFolder.Windows);
+        var systemTasks = string.IsNullOrWhiteSpace(systemRoot) ? "" : Path.Combine(systemRoot, "System32", "Tasks");
+        foreach (var candidate in startupDirs.Concat(new[] { desktop, documents, downloads, roaming, local, systemTasks }))
+        {
+            if (!string.IsNullOrWhiteSpace(candidate) && Directory.Exists(candidate))
+            {
+                paths.Add(candidate);
+            }
+        }
+        return paths.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+    }
+
+    private static FirewallIsolationResult ApplyFirewallIsolation(string executablePath)
+    {
+        var token = Guid.NewGuid().ToString("N");
+        var inboundName = $"RagnarSandbox-{token}-In";
+        var outboundName = $"RagnarSandbox-{token}-Out";
+        var applied = true;
+        var errors = new List<string>();
+        foreach (var args in new[]
+        {
+            $"advfirewall firewall add rule name=\"{inboundName}\" dir=in action=block program=\"{executablePath}\" enable=yes",
+            $"advfirewall firewall add rule name=\"{outboundName}\" dir=out action=block program=\"{executablePath}\" enable=yes",
+        })
+        {
+            if (!RunNetsh(args, out var error))
+            {
+                applied = false;
+                if (!string.IsNullOrWhiteSpace(error))
+                {
+                    errors.Add(error);
+                }
+            }
+        }
+        return new FirewallIsolationResult
+        {
+            Applied = applied,
+            RuleNames = new[] { inboundName, outboundName },
+            Errors = errors.ToArray(),
+        };
+    }
+
+    private static void RemoveFirewallIsolation(FirewallIsolationResult result)
+    {
+        foreach (var ruleName in result.RuleNames)
+        {
+            RunNetsh($"advfirewall firewall delete rule name=\"{ruleName}\"", out _);
+        }
+    }
+
+    private static bool RunNetsh(string arguments, out string error)
+    {
+        error = "";
+        try
+        {
+            using var process = new Process();
+            process.StartInfo.FileName = "netsh.exe";
+            process.StartInfo.Arguments = arguments;
+            process.StartInfo.CreateNoWindow = true;
+            process.StartInfo.UseShellExecute = false;
+            process.StartInfo.RedirectStandardError = true;
+            process.StartInfo.RedirectStandardOutput = true;
+            process.Start();
+            process.WaitForExit(15000);
+            if (process.ExitCode == 0)
+            {
+                return true;
+            }
+            error = (process.StandardError.ReadToEnd() + process.StandardOutput.ReadToEnd()).Trim();
+            return false;
+        }
+        catch (Exception exc)
+        {
+            error = exc.Message;
+            return false;
+        }
     }
 
     private static Dictionary<string, long> SnapshotDirectory(string path)
@@ -630,7 +783,20 @@ internal static class SandboxRunner
         return result;
     }
 
-    private static HashSet<string> SnapshotRunKeys(string subKey)
+    private static HashSet<string> SnapshotRunKeys(IEnumerable<string> subKeys)
+    {
+        var result = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var subKey in subKeys)
+        {
+            foreach (var value in SnapshotRunKey(subKey))
+            {
+                result.Add(value);
+            }
+        }
+        return result;
+    }
+
+    private static HashSet<string> SnapshotRunKey(string subKey)
     {
         var result = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         try
@@ -649,6 +815,23 @@ internal static class SandboxRunner
         {
         }
         return result;
+    }
+
+    private static string[] BuildStartupDirectories()
+    {
+        var directories = new List<string>();
+        foreach (var candidate in new[]
+        {
+            Environment.GetFolderPath(Environment.SpecialFolder.Startup),
+            Environment.GetFolderPath(Environment.SpecialFolder.CommonStartup),
+        })
+        {
+            if (!string.IsNullOrWhiteSpace(candidate) && Directory.Exists(candidate))
+            {
+                directories.Add(candidate);
+            }
+        }
+        return directories.Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
     }
 
     private static string ReadWallpaper()
@@ -688,6 +871,13 @@ internal sealed class LaunchContext : IDisposable
         ProcessHandle?.Dispose();
         JobHandle?.Dispose();
     }
+}
+
+internal sealed class FirewallIsolationResult
+{
+    public bool Applied { get; init; }
+    public string[] RuleNames { get; init; } = Array.Empty<string>();
+    public string[] Errors { get; init; } = Array.Empty<string>();
 }
 
 internal sealed class SafeHandleWrapper : IDisposable
@@ -804,6 +994,8 @@ internal static class NativeMethods
     public const uint CREATE_NO_WINDOW = 0x08000000;
     public const int STARTF_USESHOWWINDOW = 0x00000001;
     public const uint JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000;
+    public const uint JOB_OBJECT_LIMIT_ACTIVE_PROCESS = 0x00000008;
+    public const uint JOB_OBJECT_LIMIT_PROCESS_MEMORY = 0x00000100;
     public const uint DISABLE_MAX_PRIVILEGE = 0x1;
 
     [DllImport("kernel32.dll", SetLastError = true)]

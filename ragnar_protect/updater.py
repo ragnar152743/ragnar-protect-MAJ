@@ -153,7 +153,7 @@ class GitHubUpdateManager:
                     status["staged_path"] = str(staged_path)
                     status["staged_sha256"] = self._sha256(staged_path)
                     status["downloaded"] = True
-                    if auto_apply and self.can_self_update_in_place():
+                    if auto_apply and self.can_self_update_in_place() and self._is_remote_version_newer(remote_version, APP_VERSION):
                         apply_status = self.apply_staged_update(staged_path=staged_path)
                         status.update(apply_status)
                         status["downloaded"] = True
@@ -525,6 +525,23 @@ class GitHubUpdateManager:
         if "-" not in name:
             return ""
         return name.rsplit("-", 1)[-1]
+
+    def _is_remote_version_newer(self, remote_version: str, current_version: str) -> bool:
+        return self._parse_version(remote_version) > self._parse_version(current_version)
+
+    def _parse_version(self, value: str) -> tuple[int, ...]:
+        parts: list[int] = []
+        for piece in str(value).split("."):
+            piece = piece.strip()
+            if not piece:
+                parts.append(0)
+                continue
+            try:
+                parts.append(int(piece))
+            except ValueError:
+                numeric = "".join(ch for ch in piece if ch.isdigit())
+                parts.append(int(numeric) if numeric else 0)
+        return tuple(parts)
 
     def _read_status(self) -> dict[str, object]:
         try:

@@ -2,9 +2,9 @@
   "schema_version": 1,
   "app_name": "Ragnar Protect",
   "channel": "stable",
-  "version": "2.2.0",
+  "version": "2.3.0",
   "asset_name": "RagnarProtect.exe",
-  "size": 51899496,
-  "sha256": "8559b792e2cd8438a89bf3a7a48f7282c94c286274aecc578ca27827276d5a00",
+  "size": 51921556,
+  "sha256": "da5d80056a4d6a1d848be9b9d117294d07decafdf055c9b3239fe7e8f00a63b5",
   "exe_url": "https://raw.githubusercontent.com/ragnar152743/ragnar-protect-MAJ/main/RagnarProtect.exe"
 }

@@ -9,7 +9,28 @@ from pathlib import Path
 
 APP_NAME = "Ragnar Protect"
 LOCAL_APPDATA = Path(os.getenv("LOCALAPPDATA", Path.home() / ".ragnar"))
-APP_DIR = Path(os.getenv("RAGNAR_APP_DIR", str(LOCAL_APPDATA / "RagnarProtect")))
+PROGRAMDATA_DIR = Path(os.getenv("ProgramData", "C:\\ProgramData"))
+SHARED_STATE_DIR = PROGRAMDATA_DIR / "RagnarProtect"
+SHARED_APP_DIR_HINT = SHARED_STATE_DIR / "app_dir.txt"
+
+
+def _load_shared_app_dir_hint() -> str:
+    try:
+        if SHARED_APP_DIR_HINT.exists():
+            value = SHARED_APP_DIR_HINT.read_text(encoding="utf-8", errors="ignore").strip()
+            if value:
+                return value
+    except OSError:
+        return ""
+    return ""
+
+
+APP_DIR = Path(
+    os.getenv(
+        "RAGNAR_APP_DIR",
+        _load_shared_app_dir_hint() or str(LOCAL_APPDATA / "RagnarProtect"),
+    )
+)
 DB_PATH = APP_DIR / "ragnar_protect.db"
 LOG_DIR = APP_DIR / "logs"
 QUARANTINE_DIR = APP_DIR / "quarantine"
@@ -18,6 +39,7 @@ REPORTS_DIR = APP_DIR / "reports"
 UPDATES_DIR = APP_DIR / "updates"
 ERROR_REPORTS_DIR = APP_DIR / "error_reports"
 ROLLBACK_DIR = APP_DIR / "rollback"
+TASKBAR_SNAPSHOT_DIR = APP_DIR / "taskbar_snapshot"
 EXE_SANDBOX_DIR = SANDBOX_DIR / "executables"
 RESOURCE_ROOT = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent))
 PACKAGE_ROOT = Path(__file__).resolve().parent.parent
@@ -221,6 +243,7 @@ RAGNAR_PROTECTED_NAME_TOKENS = (
 RAGNAR_PROTECTED_TASK_TOKENS = (
     "ragnar protect background protection",
     "ragnar protect watchdog",
+    "ragnar protect early boot protection",
 )
 USER_SPACE_HINTS = {
     str(Path.home()).lower(),
@@ -243,6 +266,10 @@ BACKGROUND_CPU_PAUSE_THRESHOLD = 65
 BACKGROUND_DISK_PAUSE_THRESHOLD = 70
 BACKGROUND_BATCH_SIZE = 8
 BACKGROUND_IDLE_SECONDS = 2
+BOOT_PREFLIGHT_HOLD_SECONDS = int(os.getenv("RAGNAR_BOOT_PREFLIGHT_HOLD_SECONDS", "45"))
+BOOT_PREFLIGHT_MAX_WINDOWS_FILES = int(os.getenv("RAGNAR_BOOT_PREFLIGHT_MAX_WINDOWS_FILES", "48"))
+BOOT_PREFLIGHT_MAX_HOTSPOT_FILES = int(os.getenv("RAGNAR_BOOT_PREFLIGHT_MAX_HOTSPOT_FILES", "16"))
+BOOT_PREFLIGHT_MAX_SANDBOX_ITEMS = int(os.getenv("RAGNAR_BOOT_PREFLIGHT_MAX_SANDBOX_ITEMS", "4"))
 WATCH_REQUIRED_CLEAN_SCANS = 3
 WATCH_AUTO_UNBLOCK_DAYS = 90
 SANDBOX_QUEUE_TIMEOUT_SECONDS = 45
@@ -267,6 +294,8 @@ CANARY_PROTECTED_DIRS = [
     DESKTOP_DIR,
     DOWNLOADS_DIR,
 ]
+USER_PINNED_TASKBAR_DIR = Path(os.getenv("APPDATA", str(Path.home()))) / "Microsoft" / "Internet Explorer" / "Quick Launch" / "User Pinned" / "TaskBar"
+TASKBAND_REGISTRY_KEY = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Taskband"
 
 RAGNAR_CLOUD_LOOKUP_URL = os.getenv("RAGNAR_CLOUD_LOOKUP_URL", "")
 RAGNAR_CLOUD_EVENT_URL = os.getenv("RAGNAR_CLOUD_EVENT_URL", "")
@@ -408,6 +437,7 @@ def ensure_app_dirs() -> None:
         UPDATES_DIR,
         ERROR_REPORTS_DIR,
         ROLLBACK_DIR,
+        TASKBAR_SNAPSHOT_DIR,
         ASSETS_DIR,
     ):
         path.mkdir(parents=True, exist_ok=True)

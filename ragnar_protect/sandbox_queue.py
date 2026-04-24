@@ -67,19 +67,28 @@ class SandboxQueue:
             "launched": launched,
         }
 
-    def _loop(self) -> None:
-        while not self._stop_event.is_set():
+    def process_pending_items(self, max_items: int = 1) -> int:
+        processed = 0
+        while processed < max_items:
             item = self.database.claim_next_sandbox_item()
             if item is None:
-                self._stop_event.wait(2)
-                continue
+                break
             try:
                 report = self._process_item(item)
                 self.database.complete_sandbox_item(int(item["id"]), "done", report=report.to_dict())
                 self._apply_report(str(item["path"]), str(item["sha256"]), report)
+                processed += 1
             except Exception as exc:
                 self.logger.exception("sandbox queue item failed | %s", exc)
                 self.database.complete_sandbox_item(int(item["id"]), "error", report={}, error_text=str(exc))
+                processed += 1
+        return processed
+
+    def _loop(self) -> None:
+        while not self._stop_event.is_set():
+            processed = self.process_pending_items(max_items=1)
+            if not processed:
+                self._stop_event.wait(2)
 
     def _process_item(self, item: dict[str, Any]) -> SandboxExecutionReport:
         sample_path = Path(str(item["path"])).expanduser()

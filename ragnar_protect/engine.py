@@ -9,6 +9,7 @@ from .behavior_engine import BehaviorCorrelationEngine
 from .blocker import ProcessBlocker
 from .canary_guard import CanaryGuard
 from .cloud_reputation import CloudReputationClient
+from .config import BOOT_PREFLIGHT_HOLD_SECONDS, BOOT_PREFLIGHT_MAX_HOTSPOT_FILES, BOOT_PREFLIGHT_MAX_SANDBOX_ITEMS, BOOT_PREFLIGHT_MAX_WINDOWS_FILES
 from .database import Database
 from .error_reporter import ErrorReportMailer
 from .executable_report import ExecutableFolderReport
@@ -20,6 +21,7 @@ from .sandbox_queue import SandboxQueue
 from .scanner import RagnarScanner
 from .staged_analysis import StagePipeline
 from .system_inspector import SystemInspector
+from .taskbar_guard import TaskbarSnapshotGuard
 from .updater import GitHubUpdateManager
 from .wallpaper_guard import WallpaperGuard
 from .watch_manager import WatchManager
@@ -35,6 +37,7 @@ class RagnarProtectEngine:
         self.scanner = RagnarScanner(self.database, self.amsi)
         self.cloud = CloudReputationClient()
         self.rollback_cache = RollbackCache(self.database)
+        self.taskbar_guard = TaskbarSnapshotGuard()
         self.stage_pipeline = StagePipeline(self.scanner, self.database)
         self.benchmark_runner = BenchmarkRunner(self.scanner, self.database)
         self.watch_manager = WatchManager(self.database, self.scanner, cloud_client=self.cloud)
@@ -46,6 +49,7 @@ class RagnarProtectEngine:
             watch_manager=self.watch_manager,
             canary_guard=self.canary_guard,
             rollback_cache=self.rollback_cache,
+            taskbar_guard=self.taskbar_guard,
         )
         self.executable_report = ExecutableFolderReport(self.scanner)
         self.system_inspector = SystemInspector(self.scanner)
@@ -66,6 +70,7 @@ class RagnarProtectEngine:
 
     def start_protection(self, reduced_mode: bool = False) -> None:
         self.canary_guard.ensure_canaries()
+        self.taskbar_guard.refresh_snapshot()
         self.watch_manager.start()
         self.sandbox_queue.start()
         self.monitor.start()
@@ -129,6 +134,7 @@ class RagnarProtectEngine:
         status["error_report_configured"] = self.error_reporter.status().get("configured", False)
         status["error_report_pending"] = self.error_reporter.status().get("pending_reports", 0)
         status["rollback"] = self.rollback_cache.status()
+        status["taskbar_snapshot"] = self.taskbar_guard.status()
         return status
 
     def protection_status(self) -> dict[str, object]:
@@ -138,6 +144,24 @@ class RagnarProtectEngine:
         status["behavior_events"] = self.database.list_recent_behavior_events(limit=10)
         status["benchmark_runs"] = self.database.list_benchmark_runs(limit=5)
         return status
+
+    def boot_preflight(self) -> dict[str, object]:
+        startup_results = self.system_inspector.scan_startup_entries(remediate=True)
+        task_results = self.system_inspector.scan_scheduled_tasks(remediate=True)
+        windows_results = self.system_inspector.scan_windows_boot_surface(max_files=BOOT_PREFLIGHT_MAX_WINDOWS_FILES)
+        hotspot_results = self.system_inspector.scan_boot_hotspots(max_files_per_dir=BOOT_PREFLIGHT_MAX_HOTSPOT_FILES)
+        sandbox_processed = self.sandbox_queue.process_pending_items(max_items=BOOT_PREFLIGHT_MAX_SANDBOX_ITEMS)
+        all_results = [*startup_results, *task_results, *windows_results, *hotspot_results]
+        return {
+            "boot_preflight": True,
+            "startup_findings": len(startup_results),
+            "task_findings": len(task_results),
+            "windows_surface_findings": len(windows_results),
+            "hotspot_findings": len(hotspot_results),
+            "sandbox_items_processed": sandbox_processed,
+            "detected_malicious": sum(1 for result in all_results if getattr(result, "status", "") == "malicious"),
+            "hold_seconds": BOOT_PREFLIGHT_HOLD_SECONDS,
+        }
 
     def run_benchmark(self, corpus_dir: str) -> dict[str, object]:
         return self.benchmark_runner.run(corpus_dir).to_dict()
