@@ -5,7 +5,7 @@ import shutil
 import time
 from pathlib import Path
 
-from .config import ROLLBACK_DIR, ROLLBACK_MAX_FILE_BYTES, ROLLBACK_MAX_TOTAL_BYTES, ROLLBACK_PROTECTED_EXTENSIONS, ensure_app_dirs
+from .config import NON_DESTRUCTIVE_MODE, ROLLBACK_DIR, ROLLBACK_MAX_FILE_BYTES, ROLLBACK_MAX_TOTAL_BYTES, ROLLBACK_PROTECTED_EXTENSIONS, ensure_app_dirs
 from .database import Database
 from .logging_setup import get_logger
 from .models import RollbackArtifact
@@ -76,8 +76,6 @@ class RollbackCache:
             if not snapshot_path.exists():
                 continue
             try:
-                if original.exists():
-                    original.unlink()
                 original.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(snapshot_path, original)
                 artifact_id = int(row.get("id") or 0)
@@ -90,6 +88,8 @@ class RollbackCache:
         return restored
 
     def purge_artifacts(self, paths: list[str], incident_reason: str) -> list[str]:
+        if NON_DESTRUCTIVE_MODE:
+            return []
         removed: list[str] = []
         seen: set[str] = set()
         for value in paths:

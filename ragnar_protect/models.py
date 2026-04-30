@@ -298,10 +298,13 @@ class RollbackArtifact:
 @dataclass(slots=True)
 class BenchmarkReport:
     corpus_path: str
+    profile: str
     clean_count: int
     malicious_count: int
     ransomware_count: int
+    advanced_count: int
     detection_coverage: float
+    advanced_detection_rate: float
     pre_execution_block_rate: float
     ransomware_interruption_rate: float
     false_positive_count: int
@@ -312,10 +315,13 @@ class BenchmarkReport:
     def to_dict(self) -> dict[str, Any]:
         return {
             "corpus_path": self.corpus_path,
+            "profile": self.profile,
             "clean_count": self.clean_count,
             "malicious_count": self.malicious_count,
             "ransomware_count": self.ransomware_count,
+            "advanced_count": self.advanced_count,
             "detection_coverage": self.detection_coverage,
+            "advanced_detection_rate": self.advanced_detection_rate,
             "pre_execution_block_rate": self.pre_execution_block_rate,
             "ransomware_interruption_rate": self.ransomware_interruption_rate,
             "false_positive_count": self.false_positive_count,

@@ -40,6 +40,8 @@ UPDATES_DIR = APP_DIR / "updates"
 ERROR_REPORTS_DIR = APP_DIR / "error_reports"
 ROLLBACK_DIR = APP_DIR / "rollback"
 TASKBAR_SNAPSHOT_DIR = APP_DIR / "taskbar_snapshot"
+COMMUNITY_YARA_RULES_DIR = APP_DIR / "community_yara_rules"
+NOTIFICATIONS_DIR = APP_DIR / "notifications"
 EXE_SANDBOX_DIR = SANDBOX_DIR / "executables"
 RESOURCE_ROOT = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent))
 PACKAGE_ROOT = Path(__file__).resolve().parent.parent
@@ -59,6 +61,31 @@ RAGNAR_LEGACY_TEMP_MARKERS = (
     "ragnar-native-watch",
     "ragnar-sandbox-test",
     "ragnar-launch-intercept",
+)
+RAGNAR_RUNTIME_BUNDLE_FILE_MARKERS = {
+    "ragnarprotect.exe",
+    "ragnarnativehelper.exe",
+    "python3.dll",
+    "python311.dll",
+    "python312.dll",
+    "base_library.zip",
+    "libssl-3.dll",
+    "libcrypto-3.dll",
+    "vcruntime140.dll",
+}
+RAGNAR_RUNTIME_BUNDLE_NAME_MARKERS = {
+    "ragnarprotect",
+    "ragnarnativehelper",
+}
+RAGNAR_RUNTIME_BUNDLE_PREFIX_MARKERS = (
+    "api-ms-win-",
+    "ext-ms-",
+    "python",
+    "ucrtbase",
+    "vcruntime",
+    "msvcp",
+    "libcrypto",
+    "libssl",
 )
 
 DESKTOP_DIR = Path.home() / "Desktop"
@@ -112,6 +139,19 @@ ARCHIVE_EXTENSIONS = {".zip", ".tar", ".gz", ".tgz", ".tar.gz"}
 TEXT_SCRIPT_EXTENSIONS = {".ps1", ".bat", ".cmd", ".vbs", ".js", ".jse", ".wsf", ".hta"}
 PE_EXTENSIONS = {".exe", ".dll", ".sys", ".scr"}
 AUTHENTICODE_EXTENSIONS = PE_EXTENSIONS | {".ps1", ".vbs", ".js", ".msi", ".psm1"}
+OFFICE_DOCUMENT_EXTENSIONS = {
+    ".doc",
+    ".docm",
+    ".docx",
+    ".dotm",
+    ".xls",
+    ".xlsb",
+    ".xlsm",
+    ".xlsx",
+    ".ppt",
+    ".pptm",
+    ".pptx",
+}
 ROLLBACK_PROTECTED_EXTENSIONS = {
     ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".pdf", ".txt", ".rtf",
     ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tif", ".tiff", ".csv", ".db",
@@ -233,6 +273,34 @@ HIGH_RISK_PROCESS_NAMES = {
     "net.exe",
     "net1.exe",
 }
+TRUSTED_PUBLISHER_TOKENS = {
+    "microsoft",
+    "google",
+    "mozilla",
+    "adobe",
+    "apple",
+    "intel",
+    "nvidia",
+    "amd",
+    "epic games",
+    "riot games",
+    "ubisoft",
+    "electronic arts",
+    "valve",
+}
+TRUSTED_NETWORK_CLIENT_NAMES = {
+    "msedge.exe",
+    "chrome.exe",
+    "firefox.exe",
+    "brave.exe",
+    "opera.exe",
+    "steam.exe",
+    "epicgameslauncher.exe",
+    "onedrive.exe",
+    "teams.exe",
+    "discord.exe",
+}
+TRUSTED_NETWORK_PORTS = {53, 80, 123, 443}
 RAGNAR_PROTECTED_NAME_TOKENS = (
     "ragnarprotect.exe",
     "ragnar protect",
@@ -262,10 +330,16 @@ BEHAVIOR_CREATE_WINDOW_SECONDS = 20
 BEHAVIOR_SENSITIVE_ZONE_THRESHOLD = 3
 RANSOMWARE_EARLY_RENAME_THRESHOLD = 4
 RANSOMWARE_HARD_KILL_RENAME_THRESHOLD = 8
+RANSOMWARE_DELETE_BURST_THRESHOLD = 10
+RANSOMWARE_MODIFIED_DATA_BURST_THRESHOLD = 18
+RANSOMWARE_PREEMPTIVE_SNAPSHOT_RENAME_THRESHOLD = 2
+RANSOMWARE_PREEMPTIVE_SNAPSHOT_LIMIT = 120
+RANSOMWARE_PREEMPTIVE_SNAPSHOT_PER_DIR = 32
 BACKGROUND_CPU_PAUSE_THRESHOLD = 65
 BACKGROUND_DISK_PAUSE_THRESHOLD = 70
 BACKGROUND_BATCH_SIZE = 8
 BACKGROUND_IDLE_SECONDS = 2
+NON_DESTRUCTIVE_MODE = os.getenv("RAGNAR_NON_DESTRUCTIVE_MODE", "0").strip().lower() not in {"0", "false", "no", "off"}
 BOOT_PREFLIGHT_HOLD_SECONDS = int(os.getenv("RAGNAR_BOOT_PREFLIGHT_HOLD_SECONDS", "45"))
 BOOT_PREFLIGHT_MAX_WINDOWS_FILES = int(os.getenv("RAGNAR_BOOT_PREFLIGHT_MAX_WINDOWS_FILES", "48"))
 BOOT_PREFLIGHT_MAX_HOTSPOT_FILES = int(os.getenv("RAGNAR_BOOT_PREFLIGHT_MAX_HOTSPOT_FILES", "16"))
@@ -282,6 +356,10 @@ NATIVE_WATCHER_POLL_MILLISECONDS = 150
 NATIVE_WATCHER_STALE_SECONDS = 45
 WATCHDOG_POLL_SECONDS = int(os.getenv("RAGNAR_WATCHDOG_POLL_SECONDS", "5"))
 WATCHDOG_UPDATE_GRACE_SECONDS = int(os.getenv("RAGNAR_WATCHDOG_UPDATE_GRACE_SECONDS", "120"))
+REGISTRY_MONITOR_INTERVAL_SECONDS = int(os.getenv("RAGNAR_REGISTRY_MONITOR_INTERVAL_SECONDS", "2"))
+NETWORK_MONITOR_INTERVAL_SECONDS = int(os.getenv("RAGNAR_NETWORK_MONITOR_INTERVAL_SECONDS", "5"))
+NETWORK_PUBLIC_BURST_THRESHOLD = int(os.getenv("RAGNAR_NETWORK_PUBLIC_BURST_THRESHOLD", "5"))
+TOAST_DEDUP_SECONDS = int(os.getenv("RAGNAR_TOAST_DEDUP_SECONDS", "90"))
 CANARY_ENABLED = os.getenv("RAGNAR_CANARY_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
 CANARY_FILE_NAMES = (
     "RAGNAR_GUARD_DO_NOT_TOUCH.txt",
@@ -302,6 +380,9 @@ RAGNAR_CLOUD_EVENT_URL = os.getenv("RAGNAR_CLOUD_EVENT_URL", "")
 RAGNAR_CLOUD_REQUALIFY_URL = os.getenv("RAGNAR_CLOUD_REQUALIFY_URL", "")
 RAGNAR_CLOUD_API_KEY = os.getenv("RAGNAR_CLOUD_API_KEY", "")
 RAGNAR_CLOUD_TIMEOUT_SECONDS = int(os.getenv("RAGNAR_CLOUD_TIMEOUT_SECONDS", "8"))
+MALWAREBAZAAR_API_URL = os.getenv("RAGNAR_MALWAREBAZAAR_API_URL", "https://mb-api.abuse.ch/api/v1/")
+MALWAREBAZAAR_TIMEOUT_SECONDS = int(os.getenv("RAGNAR_MALWAREBAZAAR_TIMEOUT_SECONDS", "10"))
+MALWAREBAZAAR_CACHE_TTL_SECONDS = int(os.getenv("RAGNAR_MALWAREBAZAAR_CACHE_TTL_SECONDS", str(6 * 60 * 60)))
 RAGNAR_UPDATE_REPOSITORY = os.getenv("RAGNAR_UPDATE_REPOSITORY", "ragnar152743/ragnar-protect-MAJ")
 RAGNAR_UPDATE_BRANCH = os.getenv("RAGNAR_UPDATE_BRANCH", "main")
 RAGNAR_UPDATE_MANIFEST_PATH = os.getenv("RAGNAR_UPDATE_MANIFEST_PATH", "manifest.json")
@@ -313,6 +394,11 @@ RAGNAR_ERROR_REPORT_FROM = os.getenv("RAGNAR_ERROR_REPORT_FROM", "Ragnar Protect
 RAGNAR_ERROR_REPORT_TIMEOUT_SECONDS = int(os.getenv("RAGNAR_ERROR_REPORT_TIMEOUT_SECONDS", "20"))
 RAGNAR_ERROR_REPORT_LOG_TAIL_LINES = int(os.getenv("RAGNAR_ERROR_REPORT_LOG_TAIL_LINES", "250"))
 RAGNAR_ERROR_REPORT_ATTACH_LOG = os.getenv("RAGNAR_ERROR_REPORT_ATTACH_LOG", "1").strip().lower() not in {"0", "false", "no", "off"}
+RAGNAR_YARA_COMMUNITY_REPOSITORY = os.getenv("RAGNAR_YARA_COMMUNITY_REPOSITORY", "Yara-Rules/rules")
+RAGNAR_YARA_COMMUNITY_TIMEOUT_SECONDS = int(os.getenv("RAGNAR_YARA_COMMUNITY_TIMEOUT_SECONDS", "30"))
+RAGNAR_YARA_COMMUNITY_UPDATE_INTERVAL_SECONDS = int(
+    os.getenv("RAGNAR_YARA_COMMUNITY_UPDATE_INTERVAL_SECONDS", str(12 * 60 * 60))
+)
 
 
 def _frozen_executable_dir() -> Path | None:
@@ -362,6 +448,8 @@ def is_managed_path(path: str | Path) -> bool:
             continue
     if _is_ragnar_pyinstaller_runtime_path(resolved):
         return True
+    if _is_ragnar_runtime_bundle_path(resolved):
+        return True
     if _is_ragnar_legacy_temp_path(resolved):
         return True
     return False
@@ -383,6 +471,39 @@ def _is_ragnar_pyinstaller_runtime_path(resolved: Path) -> bool:
     except OSError:
         siblings = set()
     return bool(PYINSTALLER_RUNTIME_MARKERS.intersection(siblings))
+
+
+def _is_ragnar_runtime_bundle_path(resolved: Path) -> bool:
+    parts = [part.lower() for part in resolved.parts]
+    mei_index = next((index for index, part in enumerate(parts) if part.startswith("_mei")), -1)
+    if mei_index <= 0:
+        return False
+    try:
+        temp_root = TEMP_DIR.resolve()
+    except OSError:
+        temp_root = TEMP_DIR
+    try:
+        resolved.relative_to(temp_root)
+    except ValueError:
+        return False
+
+    file_name = resolved.name.lower()
+    if file_name in RAGNAR_RUNTIME_BUNDLE_FILE_MARKERS:
+        return True
+    if any(marker in file_name for marker in RAGNAR_RUNTIME_BUNDLE_NAME_MARKERS):
+        return True
+    if resolved.suffix.lower() in {".dll", ".pyd", ".zip"} and file_name.startswith(RAGNAR_RUNTIME_BUNDLE_PREFIX_MARKERS):
+        return True
+
+    bundle_root = Path(*resolved.parts[: mei_index + 1])
+    try:
+        siblings = {child.name.lower() for child in bundle_root.iterdir()}
+    except OSError:
+        siblings = set()
+    if siblings.intersection(RAGNAR_RUNTIME_BUNDLE_FILE_MARKERS):
+        if "ragnarprotect.exe" in siblings or "ragnarnativehelper.exe" in siblings:
+            return True
+    return any(marker in " ".join(siblings) for marker in RAGNAR_RUNTIME_BUNDLE_NAME_MARKERS)
 
 
 def _is_ragnar_legacy_temp_path(resolved: Path) -> bool:
@@ -438,6 +559,8 @@ def ensure_app_dirs() -> None:
         ERROR_REPORTS_DIR,
         ROLLBACK_DIR,
         TASKBAR_SNAPSHOT_DIR,
+        COMMUNITY_YARA_RULES_DIR,
+        NOTIFICATIONS_DIR,
         ASSETS_DIR,
     ):
         path.mkdir(parents=True, exist_ok=True)

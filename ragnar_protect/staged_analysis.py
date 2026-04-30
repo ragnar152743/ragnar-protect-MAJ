@@ -68,7 +68,7 @@ class StagePipeline:
             deep_report = self._run_isolated(candidate, "deep", STAGE5_DEEP_TIMEOUT_SECONDS)
             stage_verdicts.append(self._isolated_to_stage("stage5", deep_report))
 
-        final_verdict, aggregate_score, action = self._final_decision(stage1, stage_verdicts)
+        final_verdict, aggregate_score, action = self._final_decision(stage1, stage_verdicts, quick_report, deep_report)
         final_result = FileScanResult(
             path=stage1.path,
             sha256=stage1.sha256,
@@ -146,12 +146,16 @@ class StagePipeline:
             score = 30 if stage_name == "stage2" else 45
         elif report.verdict == "clean":
             score = -15
+        bonus_score, bonus_reasons = self._sandbox_signal_bonus(report, stage_name)
+        score += bonus_score
+        reasons = self._report_reasons(report)
+        reasons.extend(item for item in bonus_reasons if item not in reasons)
         return StageVerdict(
             stage=stage_name,
             verdict=report.verdict,
             score=score,
             summary=f"Local isolated execution {report.mode}",
-            reasons=self._report_reasons(report),
+            reasons=reasons,
             details=report.to_dict(),
         )
 
@@ -209,8 +213,25 @@ class StagePipeline:
             details={"finding_kinds": sorted(finding_kinds)},
         )
 
-    def _final_decision(self, stage1: FileScanResult, stage_verdicts: list[StageVerdict]) -> tuple[str, int, str]:
+    def _final_decision(
+        self,
+        stage1: FileScanResult,
+        stage_verdicts: list[StageVerdict],
+        quick_report: IsolatedExecutionReport | None,
+        deep_report: IsolatedExecutionReport | None,
+    ) -> tuple[str, int, str]:
         aggregate_score = sum(item.score for item in stage_verdicts if item.stage != "stage1") + stage1.score
+        if self._should_allow_after_clean_quick_stage(stage1, stage_verdicts, quick_report, deep_report):
+            return "clean", min(aggregate_score, 18), "allow"
+
+        strong_confirmations = self.scanner.count_strong_confirmations(stage1)
+        stage4_malicious = any(item.stage == "stage4" and item.verdict == "malicious" for item in stage_verdicts)
+        stage5_malicious = any(item.stage == "stage5" and item.verdict == "malicious" for item in stage_verdicts)
+        stage2_malicious = any(item.stage == "stage2" and item.verdict == "malicious" for item in stage_verdicts)
+        hard_sandbox_signal = bool(
+            (quick_report is not None and bool(quick_report.details.get("destructiveToolSeen")))
+            or (deep_report is not None and bool(deep_report.details.get("destructiveToolSeen")))
+        )
         verdict = "clean"
         if any(item.verdict == "malicious" for item in stage_verdicts):
             verdict = "malicious"
@@ -220,10 +241,33 @@ class StagePipeline:
             verdict = "suspicious"
         action = "allow"
         if verdict == "malicious":
-            action = "kill_quarantine"
+            # Progressive response: require strong confirmation or hard ransomware/sandbox evidence
+            # before destructive action.
+            if strong_confirmations >= 2 or stage4_malicious or stage5_malicious or (stage2_malicious and hard_sandbox_signal):
+                action = "kill_quarantine"
+            else:
+                verdict = "suspicious"
+                action = "observe"
         elif verdict == "suspicious":
             action = "observe"
         return verdict, aggregate_score, action
+
+    def _should_allow_after_clean_quick_stage(
+        self,
+        stage1: FileScanResult,
+        stage_verdicts: list[StageVerdict],
+        quick_report: IsolatedExecutionReport | None,
+        deep_report: IsolatedExecutionReport | None,
+    ) -> bool:
+        if quick_report is None or quick_report.verdict != "clean":
+            return False
+        if deep_report is not None and deep_report.verdict == "malicious":
+            return False
+        if any(item.stage in {"stage4", "stage5"} and item.verdict == "malicious" for item in stage_verdicts):
+            return False
+        if self.scanner.count_strong_confirmations(stage1) > 0:
+            return False
+        return bool(getattr(self.scanner, "is_low_signal_packed_pe_result", lambda _result: False)(stage1))
 
     def _merge_stage_findings(
         self,
@@ -259,6 +303,10 @@ class StagePipeline:
             reasons.append("child_process")
         if int(report.details.get("droppedExecutableCount", 0) or 0) > 0:
             reasons.append("dropped_executable")
+        if int(report.details.get("startupDropCount", 0) or 0) > 0:
+            reasons.append("startup_drop")
+        if int(report.details.get("externalDropCount", 0) or 0) > 0:
+            reasons.append("external_drop")
         if int(report.details.get("runKeyChangeCount", 0) or 0) > 0:
             reasons.append("run_key_change")
         if bool(report.details.get("wallpaperChanged")):
@@ -266,3 +314,34 @@ class StagePipeline:
         if bool(report.details.get("destructiveToolSeen")):
             reasons.append("destructive_tool_seen")
         return reasons
+
+    def _sandbox_signal_bonus(self, report: IsolatedExecutionReport, stage_name: str) -> tuple[int, list[str]]:
+        details = report.details
+        score = 0
+        reasons: list[str] = []
+        child_count = int(details.get("childCount", 0) or 0)
+        dropped_exec_count = int(details.get("droppedExecutableCount", 0) or 0)
+        startup_drop_count = int(details.get("startupDropCount", 0) or 0)
+        external_drop_count = int(details.get("externalDropCount", 0) or 0)
+        run_key_change_count = int(details.get("runKeyChangeCount", 0) or 0)
+        destructive_tool = bool(details.get("destructiveToolSeen"))
+
+        if child_count >= 3:
+            score += 8 if stage_name == "stage2" else 12
+            reasons.append("child_burst")
+        if dropped_exec_count > 0:
+            score += min(35, 12 + dropped_exec_count * 5)
+            reasons.append("dropper_behavior")
+        if startup_drop_count > 0:
+            score += min(28, 10 + startup_drop_count * 4)
+            reasons.append("startup_drop_chain")
+        if external_drop_count >= 2:
+            score += min(25, 8 + external_drop_count * 3)
+            reasons.append("external_drop_chain")
+        if run_key_change_count > 0:
+            score += min(24, 10 + run_key_change_count * 3)
+            reasons.append("runkey_persistence")
+        if destructive_tool:
+            score += 35
+            reasons.append("destructive_tool_chain")
+        return score, reasons

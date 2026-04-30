@@ -12,6 +12,7 @@ from .config import (
     HIGH_RISK_PROCESS_NAMES,
     LAUNCH_ALLOW_CACHE_SECONDS,
     LAUNCH_INTERCEPT_INTERVAL_SECONDS,
+    NON_DESTRUCTIVE_MODE,
     PE_EXTENSIONS,
     RAGNAR_PROTECTED_NAME_TOKENS,
     RAGNAR_PROTECTED_TASK_TOKENS,
@@ -93,19 +94,27 @@ class ProcessGuard:
     def _inspect_processes(self) -> None:
         now = time.time()
         for proc in psutil.process_iter(["pid", "name", "exe", "cmdline", "create_time"]):
-            pid = int(proc.info.get("pid") or 0)
-            create_time = float(proc.info.get("create_time") or 0.0)
-            key = (pid, create_time)
-            first_seen = key not in self._seen
-            if first_seen:
-                self._seen.add(key)
-            last_scan = self._last_scan.get(key, 0.0)
-            if not first_seen and now - last_scan < self.rescan_interval_seconds:
+            try:
+                pid = int(self._process_info_value(proc, "pid") or 0)
+                create_time_value = self._process_info_value(proc, "create_time")
+                if create_time_value in (None, "", []):
+                    create_time_value = self._safe_process_call(proc, "create_time")
+                create_time = float(create_time_value or 0.0)
+                if pid <= 0:
+                    continue
+                key = (pid, create_time)
+                first_seen = key not in self._seen
+                if first_seen:
+                    self._seen.add(key)
+                last_scan = self._last_scan.get(key, 0.0)
+                if not first_seen and now - last_scan < self.rescan_interval_seconds:
+                    continue
+                self._last_scan[key] = now
+                if first_seen and self.native_watch_enabled and create_time >= self._started_at - 2:
+                    continue
+                self._inspect_process(proc, key, first_seen)
+            except Exception:
                 continue
-            self._last_scan[key] = now
-            if first_seen and self.native_watch_enabled and create_time >= self._started_at - 2:
-                continue
-            self._inspect_process(proc, key, first_seen)
 
     def _handle_native_event(self, event: dict[str, object]) -> None:
         if str(event.get("event", "")) != "process_started":
@@ -238,6 +247,7 @@ class ProcessGuard:
                 if not self.stage_pipeline.native_helper.available:
                     self._hold_launch_for_observation(proc, exe, result)
                     return "observed"
+                self._queue_observation_sandbox(candidate, result)
                 if suspended:
                     if not self._resume_process(proc):
                         self.native_helper.resume_process(proc.pid)
@@ -247,10 +257,20 @@ class ProcessGuard:
                     exe,
                     result.summary(),
                 )
-                self._remember_clean_launch(candidate)
                 return "observed"
 
             if decision.action == "kill_quarantine":
+                if NON_DESTRUCTIVE_MODE:
+                    self.logger.warning(
+                        "launch flagged malicious but not blocked (non-destructive mode) | pid=%s exe=%s reason=%s",
+                        proc.pid,
+                        exe,
+                        result.summary(),
+                    )
+                    if suspended:
+                        if not self._resume_process(proc):
+                            self.native_helper.resume_process(proc.pid)
+                    return "observed"
                 self._block_process_tree(proc, exe, f"Launch intercept executable: {result.summary()}")
                 return "blocked"
             if suspended:
@@ -262,6 +282,17 @@ class ProcessGuard:
                 if not self._resume_process(proc):
                     self.native_helper.resume_process(proc.pid)
             raise
+
+    def _queue_observation_sandbox(self, candidate: Path, result) -> None:
+        try:
+            self.database.enqueue_sandbox_sample(
+                str(candidate),
+                result.sha256,
+                f"Launch observation deep sandbox: {result.summary()}",
+                priority=30,
+            )
+        except Exception as exc:
+            self.logger.debug("failed to enqueue observation sandbox sample | %s | %s", candidate, exc)
 
     def _safe_process_call(self, proc, method_name: str):
         method = getattr(proc, method_name, None)
@@ -525,6 +556,14 @@ class ProcessGuard:
         return bool(finding_kinds.intersection(weird_kinds))
 
     def _hold_launch_for_observation(self, proc, exe: str, result) -> None:
+        if NON_DESTRUCTIVE_MODE:
+            self.logger.warning(
+                "launch flagged for observation only (non-destructive mode) | pid=%s name=%s exe=%s",
+                proc.pid,
+                self._process_info_value(proc, "name"),
+                exe,
+            )
+            return
         self._terminate_process_tree(proc)
         reason = f"Launch held for background sandbox observation: {result.summary()}"
         self.database.upsert_blocked_file(
@@ -584,6 +623,15 @@ class ProcessGuard:
         return None
 
     def _block_process_tree(self, proc, exe: str, reason: str) -> None:
+        if NON_DESTRUCTIVE_MODE:
+            self.logger.warning(
+                "process flagged but not blocked (non-destructive mode) | pid=%s name=%s exe=%s reason=%s",
+                proc.pid,
+                self._process_info_value(proc, "name"),
+                exe,
+                reason,
+            )
+            return
         self._terminate_process_tree(proc)
         self._record_block(proc, exe, reason)
         self.logger.warning("process guard blocked | pid=%s name=%s exe=%s", proc.pid, self._process_info_value(proc, "name"), exe)

@@ -6,7 +6,7 @@ import threading
 from pathlib import Path
 from typing import Any
 
-from .config import PE_EXTENSIONS, SANDBOX_QUEUE_TIMEOUT_SECONDS, USER_SPACE_HINTS
+from .config import NON_DESTRUCTIVE_MODE, PE_EXTENSIONS, SANDBOX_QUEUE_TIMEOUT_SECONDS, USER_SPACE_HINTS
 from .database import Database
 from .exe_sandbox import ExecutableSandbox
 from .logging_setup import get_logger
@@ -138,6 +138,9 @@ class SandboxQueue:
         if strong_count >= 2 and report.verdict == "malicious":
             quarantined_path = str(watch_row.get("quarantined_path") or "")
             if quarantined_path and Path(quarantined_path).exists():
+                if NON_DESTRUCTIVE_MODE:
+                    self.logger.warning("non-destructive mode active; sandbox destruction skipped | %s", quarantined_path)
+                    return
                 try:
                     Path(quarantined_path).unlink()
                     metadata["destroyed_from_quarantine"] = quarantined_path

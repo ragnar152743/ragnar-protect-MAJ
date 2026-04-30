@@ -1,4 +1,6 @@
 pefile>=2023.2.7
+oletools>=0.60.2
+plyer>=2.1.0
 psutil>=6.1.0
 requests>=2.32.0
 watchdog>=6.0.0

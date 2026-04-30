@@ -60,3 +60,48 @@ rule Ragnar_PE_LowImport_Overlay : pe packer
         pe.number_of_sections <= 5 and
         pe.number_of_imported_functions <= 12
 }
+
+rule Ragnar_PE_RecoverySabotage_Strings : pe ransomware
+{
+    meta:
+        severity = 62
+        description = "PE embeds common recovery sabotage command patterns"
+        category = "ransomware"
+    strings:
+        $s1 = "vssadmin delete shadows" ascii wide nocase
+        $s2 = "wbadmin delete catalog" ascii wide nocase
+        $s3 = "bcdedit /set {default} recoveryenabled no" ascii wide nocase
+        $s4 = "bcdedit /set {default} bootstatuspolicy ignoreallfailures" ascii wide nocase
+        $s5 = "wevtutil cl" ascii wide nocase
+        $s6 = "diskshadow" ascii wide nocase
+        $s7 = "cipher /w:" ascii wide nocase
+    condition:
+        pe.is_pe and
+        2 of them
+}
+
+rule Ragnar_PE_Dropper_Inject_Combo : pe malware
+{
+    meta:
+        severity = 58
+        description = "PE combines downloader/dropper and remote-injection behavior"
+        category = "dropper"
+    condition:
+        pe.is_pe and
+        (
+            pe.imports("urlmon.dll", "URLDownloadToFileA") or
+            pe.imports("urlmon.dll", "URLDownloadToFileW") or
+            pe.imports("wininet.dll", "InternetOpenUrlA") or
+            pe.imports("wininet.dll", "InternetOpenUrlW") or
+            pe.imports("winhttp.dll", "WinHttpOpenRequest")
+        ) and
+        (
+            pe.imports("kernel32.dll", "CreateRemoteThread") or
+            pe.imports("ntdll.dll", "NtCreateThreadEx")
+        ) and
+        (
+            pe.imports("kernel32.dll", "VirtualAllocEx") or
+            pe.imports("kernel32.dll", "WriteProcessMemory") or
+            pe.imports("ntdll.dll", "NtWriteVirtualMemory")
+        )
+}

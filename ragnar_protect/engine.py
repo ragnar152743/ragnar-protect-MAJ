@@ -15,7 +15,10 @@ from .error_reporter import ErrorReportMailer
 from .executable_report import ExecutableFolderReport
 from .logging_setup import register_log_record_callback
 from .monitor import FileSystemMonitor
+from .network_monitor import NetworkConnectionMonitor
+from .notification_helper import ToastNotifier
 from .process_guard import ProcessGuard
+from .registry_monitor import RegistryPersistenceMonitor
 from .rollback_cache import RollbackCache
 from .sandbox_queue import SandboxQueue
 from .scanner import RagnarScanner
@@ -25,6 +28,7 @@ from .taskbar_guard import TaskbarSnapshotGuard
 from .updater import GitHubUpdateManager
 from .wallpaper_guard import WallpaperGuard
 from .watch_manager import WatchManager
+from .yara_rules_updater import CommunityYaraRulesUpdater
 
 
 class RagnarProtectEngine:
@@ -36,6 +40,7 @@ class RagnarProtectEngine:
         self.amsi = AmsiScanner()
         self.scanner = RagnarScanner(self.database, self.amsi)
         self.cloud = CloudReputationClient()
+        self.notifications = ToastNotifier()
         self.rollback_cache = RollbackCache(self.database)
         self.taskbar_guard = TaskbarSnapshotGuard()
         self.stage_pipeline = StagePipeline(self.scanner, self.database)
@@ -56,6 +61,8 @@ class RagnarProtectEngine:
         self.blocker = ProcessBlocker(self.database)
         self.monitor = FileSystemMonitor(self.scanner, event_callback=self.behavior_engine.handle_fs_event)
         self.process_guard = ProcessGuard(self.scanner, self.database)
+        self.registry_monitor = RegistryPersistenceMonitor(self.scanner, self.system_inspector)
+        self.network_monitor = NetworkConnectionMonitor(self.scanner, self.database)
         self.wallpaper_guard = WallpaperGuard(self.database)
         self.background_scanner = BackgroundScanScheduler(
             self.scanner,
@@ -65,8 +72,10 @@ class RagnarProtectEngine:
             rollback_cache=self.rollback_cache,
         )
         self.updater = GitHubUpdateManager()
+        self.yara_updater = CommunityYaraRulesUpdater(self.scanner.yara)
         self.scanner.register_result_callback(self.watch_manager.handle_scan_result)
         self.scanner.register_result_callback(self.sandbox_queue.consider_scan_result)
+        self.scanner.register_result_callback(self.notifications.handle_scan_result)
 
     def start_protection(self, reduced_mode: bool = False) -> None:
         self.canary_guard.ensure_canaries()
@@ -78,8 +87,11 @@ class RagnarProtectEngine:
         self.process_guard.start()
         self.behavior_engine.start()
         self.background_scanner.start()
+        self.registry_monitor.start()
+        self.network_monitor.start()
         self.wallpaper_guard.start()
         self.updater.start()
+        self.yara_updater.start()
         if reduced_mode:
             # Reduced mode still starts the same user-mode components; admin-only checks remain disabled at source.
             return
@@ -90,10 +102,13 @@ class RagnarProtectEngine:
         self.process_guard.stop()
         self.behavior_engine.stop()
         self.background_scanner.stop()
+        self.registry_monitor.stop()
+        self.network_monitor.stop()
         self.sandbox_queue.stop()
         self.watch_manager.stop()
         self.wallpaper_guard.stop()
         self.updater.stop()
+        self.yara_updater.stop()
 
     def scan_targets(self, targets: list[str]) -> list:
         results = []
@@ -135,6 +150,11 @@ class RagnarProtectEngine:
         status["error_report_pending"] = self.error_reporter.status().get("pending_reports", 0)
         status["rollback"] = self.rollback_cache.status()
         status["taskbar_snapshot"] = self.taskbar_guard.status()
+        status["yara_updater"] = self.yara_updater.status()
+        status["yara_compiler"] = self.scanner.yara.stats
+        status["notifications_available"] = self.notifications.available
+        status["registry_monitor_available"] = self.registry_monitor.available
+        status["network_monitor_available"] = self.network_monitor.available
         return status
 
     def protection_status(self) -> dict[str, object]:
@@ -143,6 +163,7 @@ class RagnarProtectEngine:
         status["sandbox_queue_depth"] = len(self.database.list_sandbox_queue(limit=200))
         status["behavior_events"] = self.database.list_recent_behavior_events(limit=10)
         status["benchmark_runs"] = self.database.list_benchmark_runs(limit=5)
+        status["dashboard_summary"] = self.database.get_dashboard_summary()
         return status
 
     def boot_preflight(self) -> dict[str, object]:
@@ -163,14 +184,23 @@ class RagnarProtectEngine:
             "hold_seconds": BOOT_PREFLIGHT_HOLD_SECONDS,
         }
 
-    def run_benchmark(self, corpus_dir: str) -> dict[str, object]:
-        return self.benchmark_runner.run(corpus_dir).to_dict()
+    def run_benchmark(self, corpus_dir: str, profile: str = "standard") -> dict[str, object]:
+        return self.benchmark_runner.run(corpus_dir, profile=profile).to_dict()
+
+    def run_hard_benchmark(self, output_dir: str | None = None) -> dict[str, object]:
+        return self.benchmark_runner.run_hard_suite(output_dir).to_dict()
 
     def check_updates(self, auto_download: bool = True, auto_apply: bool = False) -> dict[str, object]:
         return self.updater.check_now(auto_download=auto_download, auto_apply=auto_apply)
 
     def update_status(self) -> dict[str, object]:
         return self.updater.status()
+
+    def yara_update_status(self) -> dict[str, object]:
+        return self.yara_updater.status()
+
+    def update_yara_rules(self) -> dict[str, object]:
+        return self.yara_updater.check_now()
 
     def error_report_status(self) -> dict[str, object]:
         return self.error_reporter.status()

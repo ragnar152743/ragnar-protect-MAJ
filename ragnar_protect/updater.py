@@ -365,13 +365,13 @@ class GitHubUpdateManager:
         seen: set[tuple[str, ...]] = set()
         for proc in psutil.process_iter(["pid", "exe", "cmdline"]):
             try:
-                exe = str(proc.info.get("exe") or proc.exe() or "").lower()
+                exe = str(self._process_info_value(proc, "exe") or proc.exe() or "").lower()
             except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess, OSError):
                 continue
             if exe != executable_text:
                 continue
             try:
-                raw_cmdline = proc.info.get("cmdline") or proc.cmdline()
+                raw_cmdline = self._process_info_value(proc, "cmdline") or proc.cmdline()
             except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess, OSError):
                 raw_cmdline = []
             cmdline = [str(item) for item in raw_cmdline if str(item).strip()]
@@ -554,6 +554,20 @@ class GitHubUpdateManager:
     def _write_status(self, payload: dict[str, object]) -> None:
         ensure_app_dirs()
         self._status_path.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
+
+    def _process_info_value(self, proc, key: str):
+        info = getattr(proc, "info", None)
+        if isinstance(info, dict):
+            value = info.get(key)
+            if value not in (None, "", []):
+                return value
+        accessor = getattr(proc, key, None)
+        if callable(accessor):
+            try:
+                return accessor()
+            except Exception:
+                return None
+        return accessor
 
     def _sha256(self, file_path: Path) -> str:
         import hashlib

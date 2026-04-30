@@ -11,6 +11,7 @@ from .config import (
     BOOT_PREFLIGHT_MAX_WINDOWS_FILES,
     DEFAULT_MONITORED_DIRS,
     HIGH_RISK_PROCESS_NAMES,
+    OFFICE_DOCUMENT_EXTENSIONS,
     ROLLBACK_PROTECTED_EXTENSIONS,
     SENSITIVE_EXTENSIONS,
     STARTUP_DIRS,
@@ -51,6 +52,7 @@ class SystemInspector:
         results = []
         results.extend(self.scan_hotspots(max_files_per_dir=max_files_per_dir))
         results.extend(self.scan_running_processes())
+        results.extend(self.scan_network_connections())
         results.extend(self.scan_startup_entries())
         results.extend(self.scan_scheduled_tasks())
         return results
@@ -58,6 +60,7 @@ class SystemInspector:
     def system_audit(self) -> list:
         results = []
         results.extend(self.scan_running_processes())
+        results.extend(self.scan_network_connections())
         results.extend(self.scan_startup_entries())
         results.extend(self.scan_scheduled_tasks())
         return results
@@ -111,11 +114,14 @@ class SystemInspector:
         results = []
         scanned_executables: set[str] = set()
         for proc in psutil.process_iter(["pid", "name", "exe", "cmdline", "create_time", "ppid"]):
-            artifact_result, executable_result = self._inspect_process(
-                proc.info,
-                scan_executable=True,
-                scanned_executables=scanned_executables,
-            )
+            try:
+                artifact_result, executable_result = self._inspect_process(
+                    self._build_process_info(proc),
+                    scan_executable=True,
+                    scanned_executables=scanned_executables,
+                )
+            except Exception:
+                continue
             if artifact_result is not None:
                 results.append(artifact_result)
             if executable_result is not None:
@@ -243,6 +249,54 @@ class SystemInspector:
                 results.append(self.scanner.scan_file(candidate))
             except Exception as exc:
                 self.logger.exception("windows boot surface scan failed | %s | %s", candidate, exc)
+        return results
+
+    def scan_network_connections(self) -> list:
+        if psutil is None:
+            return []
+        results = []
+        seen: set[tuple[int, str, int]] = set()
+        for conn in psutil.net_connections(kind="inet"):
+            pid = int(getattr(conn, "pid", 0) or 0)
+            raddr = getattr(conn, "raddr", None)
+            status = str(getattr(conn, "status", "") or "")
+            if pid <= 0 or raddr is None or not getattr(raddr, "ip", ""):
+                continue
+            if status not in {"ESTABLISHED", "SYN_SENT", "CLOSE_WAIT"}:
+                continue
+            try:
+                proc = psutil.Process(pid)
+                process_name = str(proc.name() or "")
+                exe = str(proc.exe() or "")
+            except Exception:
+                continue
+            if not exe or is_managed_path(exe):
+                continue
+            remote_ip = str(raddr.ip)
+            if remote_ip.startswith(("127.", "169.254.", "10.", "192.168.")):
+                continue
+            key = (pid, remote_ip, int(getattr(raddr, "port", 0) or 0))
+            if key in seen:
+                continue
+            seen.add(key)
+            artifact = self.scanner.scan_artifact(
+                display_path=f"network://{pid}/{process_name}->{remote_ip}:{raddr.port}",
+                content=f"{process_name} {exe} {remote_ip}:{raddr.port} {status}",
+                extension=".network",
+                metadata={
+                    "artifact_type": "network-connection",
+                    "pid": pid,
+                    "process_name": process_name,
+                    "exe": exe,
+                    "remote_ip": remote_ip,
+                    "remote_port": int(raddr.port),
+                    "state": status,
+                },
+                persist=True,
+                persist_clean=False,
+            )
+            if process_name.lower() in HIGH_RISK_PROCESS_NAMES or artifact.status != "clean":
+                results.append(artifact)
         return results
 
     def _inspect_process(
@@ -470,7 +524,12 @@ class SystemInspector:
         if is_managed_path(path):
             return False
         extension = path.suffix.lower()
-        if extension in SENSITIVE_EXTENSIONS or extension in ARCHIVE_EXTENSIONS or extension in ROLLBACK_PROTECTED_EXTENSIONS:
+        if (
+            extension in SENSITIVE_EXTENSIONS
+            or extension in ARCHIVE_EXTENSIONS
+            or extension in ROLLBACK_PROTECTED_EXTENSIONS
+            or extension in OFFICE_DOCUMENT_EXTENSIONS
+        ):
             return True
         if extension in {".com", ".cpl", ".ocx", ".job", ".efi"}:
             return True
@@ -501,6 +560,34 @@ class SystemInspector:
                 if candidate.exists():
                     roots.append(candidate)
         return roots
+
+    def _build_process_info(self, proc) -> dict[str, object]:
+        info = getattr(proc, "info", None)
+        if not isinstance(info, dict):
+            info = {}
+        payload = dict(info)
+        if not payload.get("pid"):
+            payload["pid"] = getattr(proc, "pid", 0)
+        if not payload.get("name"):
+            payload["name"] = self._safe_process_call(proc, "name")
+        if not payload.get("exe"):
+            payload["exe"] = self._safe_process_call(proc, "exe")
+        if not payload.get("cmdline"):
+            payload["cmdline"] = self._safe_process_call(proc, "cmdline") or []
+        if not payload.get("create_time"):
+            payload["create_time"] = self._safe_process_call(proc, "create_time")
+        if not payload.get("ppid"):
+            payload["ppid"] = self._safe_process_call(proc, "ppid")
+        return payload
+
+    def _safe_process_call(self, proc, method_name: str):
+        method = getattr(proc, method_name, None)
+        if method is None:
+            return None
+        try:
+            return method()
+        except Exception:
+            return None
 
     def _extract_candidate_paths(self, command: str) -> list[Path]:
         expanded = os.path.expandvars(command.strip().strip('"'))

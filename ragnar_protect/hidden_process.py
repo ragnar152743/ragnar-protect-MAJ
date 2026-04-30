@@ -19,6 +19,10 @@ def _apply_hidden_windows_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
     if hasattr(subprocess, "CREATE_NO_WINDOW"):
         merged["creationflags"] = int(merged.get("creationflags", 0)) | int(subprocess.CREATE_NO_WINDOW)
 
+    if merged.get("text") and "errors" not in merged:
+        # Avoid background reader crashes on locale-specific undecodable bytes.
+        merged["errors"] = "ignore"
+
     return merged
 
 

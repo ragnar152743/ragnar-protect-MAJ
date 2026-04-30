@@ -18,8 +18,14 @@ from .config import (
     BEHAVIOR_RENAME_WINDOW_SECONDS,
     BEHAVIOR_SENSITIVE_ZONE_THRESHOLD,
     HIGH_RISK_PROCESS_NAMES,
+    NON_DESTRUCTIVE_MODE,
     RANSOMWARE_EARLY_RENAME_THRESHOLD,
     RANSOMWARE_HARD_KILL_RENAME_THRESHOLD,
+    RANSOMWARE_DELETE_BURST_THRESHOLD,
+    RANSOMWARE_MODIFIED_DATA_BURST_THRESHOLD,
+    RANSOMWARE_PREEMPTIVE_SNAPSHOT_LIMIT,
+    RANSOMWARE_PREEMPTIVE_SNAPSHOT_PER_DIR,
+    RANSOMWARE_PREEMPTIVE_SNAPSHOT_RENAME_THRESHOLD,
     SENSITIVE_EXTENSIONS,
     SENSITIVE_ZONE_PATHS,
     USER_SPACE_HINTS,
@@ -50,9 +56,11 @@ class BehaviorCorrelationEngine:
         self._rename_events: deque[dict[str, Any]] = deque()
         self._modify_events: deque[dict[str, Any]] = deque()
         self._create_events: deque[dict[str, Any]] = deque()
+        self._delete_events: deque[dict[str, Any]] = deque()
         self._last_incidents: dict[str, float] = {}
         self._process_samples: dict[int, dict[str, float]] = {}
         self._disk_sample: dict[str, float] | None = None
+        self._last_preemptive_snapshot_at = 0.0
 
     _COMMON_DATA_EXTENSIONS = {
         ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".pdf", ".txt", ".rtf",
@@ -145,6 +153,9 @@ class BehaviorCorrelationEngine:
                 self._create_events.append(item)
             elif item["is_canary"]:
                 self._create_events.append(item)
+        elif item["event_type"] == "deleted":
+            if item["src_ext"] in self._COMMON_DATA_EXTENSIONS or item["is_canary"]:
+                self._delete_events.append(item)
         else:
             self._modify_events.append(item)
         self._trim_events()
@@ -159,6 +170,7 @@ class BehaviorCorrelationEngine:
             (self._rename_events, BEHAVIOR_RENAME_WINDOW_SECONDS),
             (self._modify_events, BEHAVIOR_MODIFY_WINDOW_SECONDS),
             (self._create_events, BEHAVIOR_CREATE_WINDOW_SECONDS),
+            (self._delete_events, BEHAVIOR_MODIFY_WINDOW_SECONDS),
         )
         for bucket, window in limits:
             while bucket and now - float(bucket[0]["timestamp"]) > window:
@@ -168,28 +180,41 @@ class BehaviorCorrelationEngine:
         rename_count = len(self._rename_events)
         modify_count = len(self._modify_events)
         create_count = len(self._create_events)
+        delete_count = len(self._delete_events)
         ransomware_signals = self._analyze_ransomware_signals()
         if (
             rename_count < BEHAVIOR_RENAME_THRESHOLD
             and modify_count < BEHAVIOR_MODIFY_THRESHOLD
             and create_count < BEHAVIOR_CREATE_THRESHOLD
+            and delete_count < RANSOMWARE_DELETE_BURST_THRESHOLD
             and ransomware_signals["ransom_note_count"] == 0
             and ransomware_signals["encrypted_rename_count"] < RANSOMWARE_EARLY_RENAME_THRESHOLD
+            and ransomware_signals["modified_data_count"] < RANSOMWARE_MODIFIED_DATA_BURST_THRESHOLD
+            and ransomware_signals["deleted_data_count"] < RANSOMWARE_DELETE_BURST_THRESHOLD
             and ransomware_signals["canary_event_count"] == 0
         ):
             return None
 
         touched_paths = self._collect_touched_paths()
+        self._maybe_snapshot_before_spread(ransomware_signals, touched_paths)
         sensitive_zones = sorted(
             {
                 zone
-                for bucket in (self._rename_events, self._modify_events, self._create_events)
+                for bucket in (self._rename_events, self._modify_events, self._create_events, self._delete_events)
                 for item in bucket
                 for zone in item["zone_names"]
             }
         )
         process_info = self._attribute_process(path)
         attributed = process_info is not None and int(process_info.get("confidence", 0)) >= 35
+        process_user_space = bool(process_info.get("user_space")) if process_info else False
+        process_name_lower = str(process_info.get("name", "")).lower() if process_info else ""
+        ransomware_pattern = (
+            ransomware_signals["encrypted_rename_count"] >= RANSOMWARE_EARLY_RENAME_THRESHOLD
+            or ransomware_signals["ransom_note_count"] > 0
+            or ransomware_signals["deleted_data_count"] >= RANSOMWARE_DELETE_BURST_THRESHOLD
+            or ransomware_signals["canary_event_count"] > 0
+        )
         stage = "stage1"
         score = 0
         actions: list[str] = []
@@ -203,6 +228,9 @@ class BehaviorCorrelationEngine:
         if create_count >= BEHAVIOR_CREATE_THRESHOLD:
             incident_type = "create_burst" if incident_type == "behavior_burst" else incident_type
             score += 30
+        if delete_count >= RANSOMWARE_DELETE_BURST_THRESHOLD:
+            incident_type = "delete_burst" if incident_type == "behavior_burst" else incident_type
+            score += 65
         if len(sensitive_zones) >= BEHAVIOR_SENSITIVE_ZONE_THRESHOLD:
             score += 25
         if ransomware_signals["canary_event_count"] > 0:
@@ -216,6 +244,12 @@ class BehaviorCorrelationEngine:
         if ransomware_signals["ransom_note_count"] > 0:
             incident_type = "ransom_note_burst"
             score += 60
+        if ransomware_signals["modified_data_count"] >= RANSOMWARE_MODIFIED_DATA_BURST_THRESHOLD:
+            incident_type = "data_modify_burst" if incident_type == "behavior_burst" else incident_type
+            score += 35
+        if ransomware_signals["deleted_data_count"] >= RANSOMWARE_DELETE_BURST_THRESHOLD:
+            incident_type = "data_delete_burst" if incident_type == "behavior_burst" else incident_type
+            score += 45
         if ransomware_signals["unique_touched_parent_count"] >= 5:
             score += 15
         if attributed:
@@ -235,6 +269,8 @@ class BehaviorCorrelationEngine:
             and (
                 ransomware_signals["encrypted_rename_count"] >= RANSOMWARE_EARLY_RENAME_THRESHOLD
                 or ransomware_signals["ransom_note_count"] > 0
+                or ransomware_signals["deleted_data_count"] >= RANSOMWARE_DELETE_BURST_THRESHOLD
+                or ransomware_signals["modified_data_count"] >= RANSOMWARE_MODIFIED_DATA_BURST_THRESHOLD
                 or ransomware_signals["canary_event_count"] > 0
             )
         )
@@ -244,7 +280,15 @@ class BehaviorCorrelationEngine:
 
         global_metrics = self._global_metrics()
         proc_write_rate = float(process_info.get("write_rate", 0.0)) if attributed else 0.0
-        effective_pid = int(process_info.get("pid")) if (attributed or killable_fallback) and process_info and process_info.get("pid") else None
+        kill_eligible = bool(
+            process_info
+            and int(process_info.get("pid") or 0) > 0
+            and (
+                bool(process_info.get("user_space"))
+                or str(process_info.get("name", "")).lower() in HIGH_RISK_PROCESS_NAMES
+            )
+        )
+        effective_pid = int(process_info.get("pid")) if (attributed or killable_fallback) and kill_eligible and process_info and process_info.get("pid") else None
         effective_write_rate = float(process_info.get("write_rate", 0.0)) if (attributed or killable_fallback) and process_info else 0.0
         causal = effective_pid is not None and (
             effective_write_rate >= 1_500_000
@@ -252,23 +296,33 @@ class BehaviorCorrelationEngine:
             or (float(global_metrics.get("disk_percent", 0.0)) >= 70 and effective_write_rate >= 250_000)
             or ransomware_signals["encrypted_rename_count"] >= RANSOMWARE_HARD_KILL_RENAME_THRESHOLD
             or ransomware_signals["ransom_note_count"] > 0
+            or ransomware_signals["deleted_data_count"] >= RANSOMWARE_DELETE_BURST_THRESHOLD
+            or ransomware_signals["modified_data_count"] >= RANSOMWARE_MODIFIED_DATA_BURST_THRESHOLD
             or ransomware_signals["canary_event_count"] > 0
         )
 
-        if effective_pid is not None and (
+        destructive_activity = (
             rename_count >= BEHAVIOR_RENAME_THRESHOLD
             or modify_count >= BEHAVIOR_MODIFY_THRESHOLD
             or (create_count >= BEHAVIOR_CREATE_THRESHOLD and len(sensitive_zones) >= BEHAVIOR_SENSITIVE_ZONE_THRESHOLD)
+            or delete_count >= RANSOMWARE_DELETE_BURST_THRESHOLD
             or ransomware_signals["encrypted_rename_count"] >= RANSOMWARE_EARLY_RENAME_THRESHOLD
             or ransomware_signals["ransom_note_count"] > 0
+            or ransomware_signals["deleted_data_count"] >= RANSOMWARE_DELETE_BURST_THRESHOLD
+            or ransomware_signals["modified_data_count"] >= RANSOMWARE_MODIFIED_DATA_BURST_THRESHOLD
             or ransomware_signals["canary_event_count"] > 0
-        ):
+        )
+        strong_non_ransom_burst = (
+            rename_count >= BEHAVIOR_RENAME_THRESHOLD
+            and modify_count >= BEHAVIOR_MODIFY_THRESHOLD
+            and len(sensitive_zones) >= BEHAVIOR_SENSITIVE_ZONE_THRESHOLD
+            and process_user_space
+        )
+        if effective_pid is not None and destructive_activity:
             if (
-                causal
-                or rename_count >= BEHAVIOR_RENAME_THRESHOLD
-                or ransomware_signals["encrypted_rename_count"] >= RANSOMWARE_EARLY_RENAME_THRESHOLD
-                or ransomware_signals["ransom_note_count"] > 0
-                or ransomware_signals["canary_event_count"] > 0
+                ransomware_pattern
+                or (causal and strong_non_ransom_burst)
+                or (causal and process_name_lower in HIGH_RISK_PROCESS_NAMES)
             ):
                 stage = "stage2"
                 actions.extend(["kill_process", "block_hash", "scan_recent_artifacts"])
@@ -282,7 +336,7 @@ class BehaviorCorrelationEngine:
         self._last_incidents[signature] = time.time()
 
         reason = (
-            f"{rename_count} renames, {modify_count} modifications, {create_count} creations, "
+            f"{rename_count} renames, {modify_count} modifications, {create_count} creations, {delete_count} deletions, "
             f"{len(sensitive_zones)} sensitive zone(s)"
         )
         return BehaviorIncident(
@@ -301,6 +355,7 @@ class BehaviorCorrelationEngine:
                 "rename_count": rename_count,
                 "modify_count": modify_count,
                 "create_count": create_count,
+                "delete_count": delete_count,
                 "sensitive_zones": sensitive_zones,
                 "ransomware_signals": ransomware_signals,
                 "global_metrics": global_metrics,
@@ -322,6 +377,13 @@ class BehaviorCorrelationEngine:
             incident.reason,
         )
         if incident.stage != "stage2" or not incident.process_pid:
+            return
+        if NON_DESTRUCTIVE_MODE:
+            self.logger.warning(
+                "stage2 incident not enforcing kill/block (non-destructive mode) | type=%s pid=%s",
+                incident.incident_type,
+                incident.process_pid,
+            )
             return
         self._kill_and_contain(incident)
 
@@ -358,7 +420,11 @@ class BehaviorCorrelationEngine:
             if restored_paths:
                 self.logger.warning("rollback restored %s path(s) after incident", len(restored_paths))
             ransomware_signals = incident.metadata.get("ransomware_signals", {}) if isinstance(incident.metadata, dict) else {}
-            cleanup_candidates = list(ransomware_signals.get("encrypted_paths", [])) + list(ransomware_signals.get("ransom_note_paths", []))
+            cleanup_candidates = (
+                list(ransomware_signals.get("encrypted_paths", []))
+                + list(ransomware_signals.get("ransom_note_paths", []))
+                + list(ransomware_signals.get("deleted_paths", []))
+            )
             removed_artifacts = self.rollback_cache.purge_artifacts(cleanup_candidates, incident.reason)
             if removed_artifacts:
                 self.logger.warning("rollback cleanup removed %s encrypted artifact(s)", len(removed_artifacts))
@@ -381,7 +447,7 @@ class BehaviorCorrelationEngine:
     def _collect_touched_paths(self) -> list[str]:
         seen: set[str] = set()
         paths: list[str] = []
-        for bucket in (self._rename_events, self._modify_events, self._create_events):
+        for bucket in (self._rename_events, self._modify_events, self._create_events, self._delete_events):
             for item in list(bucket)[-40:]:
                 for value in (str(item.get("src_path") or item["path"]), str(item.get("dest_path") or item["path"])):
                     if not value or value in seen:
@@ -389,6 +455,69 @@ class BehaviorCorrelationEngine:
                     seen.add(value)
                     paths.append(value)
         return paths
+
+    def _maybe_snapshot_before_spread(self, ransomware_signals: dict[str, Any], touched_paths: list[str]) -> None:
+        if self.rollback_cache is None:
+            return
+        now = time.time()
+        if now - self._last_preemptive_snapshot_at < 8:
+            return
+        if (
+            int(ransomware_signals.get("encrypted_rename_count", 0)) < RANSOMWARE_PREEMPTIVE_SNAPSHOT_RENAME_THRESHOLD
+            and int(ransomware_signals.get("ransom_note_count", 0)) == 0
+            and int(ransomware_signals.get("modified_data_count", 0)) < RANSOMWARE_MODIFIED_DATA_BURST_THRESHOLD
+            and int(ransomware_signals.get("deleted_data_count", 0)) < RANSOMWARE_DELETE_BURST_THRESHOLD
+            and int(ransomware_signals.get("canary_event_count", 0)) == 0
+        ):
+            return
+
+        touched_set = {str(Path(value).expanduser()).lower() for value in touched_paths if value}
+        candidate_dirs: list[Path] = []
+        seen_dirs: set[str] = set()
+        for value in list(ransomware_signals.get("encrypted_paths", [])) + list(ransomware_signals.get("deleted_paths", [])) + touched_paths:
+            if not value:
+                continue
+            parent = Path(value).expanduser().parent
+            normalized = str(parent).lower()
+            if normalized in seen_dirs:
+                continue
+            seen_dirs.add(normalized)
+            candidate_dirs.append(parent)
+
+        snapshot_count = 0
+        for directory in candidate_dirs:
+            if snapshot_count >= RANSOMWARE_PREEMPTIVE_SNAPSHOT_LIMIT:
+                break
+            per_dir_count = 0
+            try:
+                files = sorted(
+                    (entry for entry in directory.iterdir() if entry.is_file()),
+                    key=lambda item: item.name.lower(),
+                )
+            except OSError:
+                continue
+            for file_path in files:
+                if per_dir_count >= RANSOMWARE_PREEMPTIVE_SNAPSHOT_PER_DIR or snapshot_count >= RANSOMWARE_PREEMPTIVE_SNAPSHOT_LIMIT:
+                    break
+                normalized_file = str(file_path).lower()
+                if normalized_file in touched_set:
+                    continue
+                try:
+                    if is_managed_path(file_path):
+                        continue
+                except Exception:
+                    continue
+                if not self.rollback_cache.should_protect(file_path):
+                    continue
+                snapshot_path = self.rollback_cache.snapshot_file(file_path, reason="preemptive-ransomware")
+                if not snapshot_path:
+                    continue
+                snapshot_count += 1
+                per_dir_count += 1
+
+        if snapshot_count:
+            self._last_preemptive_snapshot_at = now
+            self.logger.info("preemptive rollback snapshots captured | count=%s", snapshot_count)
 
     def _attribute_process(self, target_path: Path) -> dict[str, Any] | None:
         if psutil is None:
@@ -399,10 +528,11 @@ class BehaviorCorrelationEngine:
         now = time.time()
         for proc in psutil.process_iter(["pid", "name", "exe", "cmdline", "create_time"]):
             try:
-                name = str(proc.info.get("name") or "")
-                exe = str(proc.info.get("exe") or "")
-                cmdline = " ".join(str(part) for part in (proc.info.get("cmdline") or []) if part)
-                create_time = float(proc.info.get("create_time") or 0.0)
+                name = str(self._process_info_value(proc, "name") or "")
+                exe = str(self._process_info_value(proc, "exe") or "")
+                raw_cmdline = self._process_info_value(proc, "cmdline") or []
+                cmdline = " ".join(str(part) for part in raw_cmdline if part)
+                create_time = float(self._process_info_value(proc, "create_time") or 0.0)
                 if not exe and not cmdline:
                     continue
                 recent = now - create_time <= 90 if create_time else False
@@ -446,7 +576,7 @@ class BehaviorCorrelationEngine:
                     confidence += 10
                 if best is None or confidence > int(best.get("confidence", 0)):
                     best = {
-                        "pid": int(proc.info.get("pid") or 0),
+                        "pid": int(self._process_info_value(proc, "pid") or 0),
                         "name": name,
                         "exe": exe,
                         "cmdline": cmdline,
@@ -460,6 +590,22 @@ class BehaviorCorrelationEngine:
             except Exception:
                 continue
         return best
+
+    def _process_info_value(self, proc, key: str):
+        info = getattr(proc, "info", None)
+        if isinstance(info, dict):
+            value = info.get(key)
+            if value not in (None, "", []):
+                return value
+        if key == "pid":
+            return getattr(proc, "pid", 0)
+        accessor = getattr(proc, key, None)
+        if callable(accessor):
+            try:
+                return accessor()
+            except Exception:
+                return None
+        return accessor
 
     def _sample_process(self, proc) -> dict[str, float]:
         now = time.time()
@@ -544,11 +690,14 @@ class BehaviorCorrelationEngine:
         encrypted_rename_count = 0
         encrypted_extension_counts: dict[str, int] = {}
         ransom_note_count = 0
+        modified_data_count = 0
+        deleted_data_count = 0
         touched_parents: set[str] = set()
         canary_event_count = 0
         canary_paths: set[str] = set()
         encrypted_paths: list[str] = []
         ransom_note_paths: list[str] = []
+        deleted_paths: list[str] = []
 
         for item in self._rename_events:
             src_path = Path(str(item.get("src_path") or item["path"]))
@@ -577,7 +726,19 @@ class BehaviorCorrelationEngine:
             if bool(item.get("is_canary")):
                 canary_event_count += 1
                 canary_paths.add(str(modified_path))
+            if modified_path.suffix.lower() in self._COMMON_DATA_EXTENSIONS:
+                modified_data_count += 1
             touched_parents.add(str(modified_path.parent).lower())
+
+        for item in self._delete_events:
+            deleted_path = Path(str(item.get("src_path") or item.get("path") or ""))
+            if bool(item.get("is_canary")):
+                canary_event_count += 1
+                canary_paths.add(str(deleted_path))
+            if deleted_path.suffix.lower() in self._COMMON_DATA_EXTENSIONS:
+                deleted_data_count += 1
+                deleted_paths.append(str(deleted_path))
+            touched_parents.add(str(deleted_path.parent).lower())
 
         dominant_encrypted_extension = ""
         dominant_encrypted_extension_count = 0
@@ -593,8 +754,11 @@ class BehaviorCorrelationEngine:
             "dominant_encrypted_extension": dominant_encrypted_extension,
             "dominant_encrypted_extension_count": dominant_encrypted_extension_count,
             "ransom_note_count": ransom_note_count,
+            "modified_data_count": modified_data_count,
+            "deleted_data_count": deleted_data_count,
             "encrypted_paths": encrypted_paths[-40:],
             "ransom_note_paths": ransom_note_paths[-20:],
+            "deleted_paths": deleted_paths[-40:],
             "unique_touched_parent_count": len(touched_parents),
             "canary_event_count": canary_event_count,
             "canary_paths": sorted(canary_paths),

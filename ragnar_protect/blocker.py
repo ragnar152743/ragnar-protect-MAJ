@@ -4,6 +4,7 @@ import hashlib
 import threading
 from pathlib import Path
 
+from .config import NON_DESTRUCTIVE_MODE, is_managed_path
 from .database import Database
 from .logging_setup import get_logger
 
@@ -49,6 +50,8 @@ class ProcessBlocker:
             self._stop_event.wait(self.interval_seconds)
 
     def _enforce_blocklist(self) -> None:
+        if NON_DESTRUCTIVE_MODE:
+            return
         blocklist = self.database.get_active_blocklist()
         if not blocklist:
             return
@@ -56,29 +59,40 @@ class ProcessBlocker:
         blocked_hashes = {item["sha256"].lower(): item for item in blocklist}
 
         for proc in psutil.process_iter(["pid", "name", "exe"]):
-            exe = proc.info.get("exe")
-            if not exe:
-                continue
-            normalized = Path(exe).as_posix().lower()
-            item = blocked_paths.get(normalized)
-            file_hash = None
-            if item is None:
-                file_hash = self._cached_sha256(Path(exe))
-                item = blocked_hashes.get(file_hash.lower()) if file_hash else None
-            if item is None:
-                continue
             try:
+                exe = self._process_info_value(proc, "exe")
+                if not exe:
+                    continue
+                normalized = Path(str(exe)).as_posix().lower()
+                if is_managed_path(exe):
+                    managed_item = blocked_paths.get(normalized)
+                    if managed_item is not None:
+                        self.database.deactivate_blocked_file(
+                            str(managed_item.get("path", "")),
+                            str(managed_item.get("sha256", "")),
+                        )
+                    continue
+                item = blocked_paths.get(normalized)
+                file_hash = None
+                if item is None:
+                    file_hash = self._cached_sha256(Path(str(exe)))
+                    item = blocked_hashes.get(file_hash.lower()) if file_hash else None
+                if item is None:
+                    continue
+                if is_managed_path(item.get("path", "")):
+                    self.database.deactivate_blocked_file(str(item.get("path", "")), str(item.get("sha256", "")))
+                    continue
                 self._terminate_process_tree(proc)
             except Exception:
                 continue
             self.database.record_block_event(
-                pid=proc.info.get("pid"),
-                process_name=proc.info.get("name"),
-                exe_path=exe,
+                pid=self._process_info_value(proc, "pid"),
+                process_name=self._process_info_value(proc, "name"),
+                exe_path=str(exe),
                 sha256=file_hash or item["sha256"],
                 reason=item["reason"],
             )
-            self.logger.warning("blocked process | pid=%s exe=%s", proc.info.get("pid"), exe)
+            self.logger.warning("blocked process | pid=%s exe=%s", self._process_info_value(proc, "pid"), exe)
 
     def _terminate_process_tree(self, proc) -> None:
         try:
@@ -125,3 +139,19 @@ class ProcessBlocker:
         value = digest.hexdigest()
         self._hash_cache[cache_key] = (stat.st_mtime, stat.st_size, value)
         return value
+
+    def _process_info_value(self, proc, key: str):
+        info = getattr(proc, "info", None)
+        if isinstance(info, dict):
+            value = info.get(key)
+            if value not in (None, "", []):
+                return value
+        if key == "pid":
+            return getattr(proc, "pid", 0)
+        accessor = getattr(proc, key, None)
+        if callable(accessor):
+            try:
+                return accessor()
+            except Exception:
+                return None
+        return accessor

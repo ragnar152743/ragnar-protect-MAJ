@@ -11,6 +11,7 @@ Current MVP features:
 - AMSI integration when available on Windows
 - Authenticode verification through PowerShell
 - Local reputation scoring based on hash history, certificate, and publisher metadata
+- Trusted publisher baseline scoring to reduce false positives on signed mainstream software
 - Deep ZIP/TAR archive inspection
 - Executable folder scan mode with JSON and Markdown reports
 - Native local isolated execution for suspicious executables
@@ -20,6 +21,7 @@ Current MVP features:
 - Quarantine, restore, and execution blocking for flagged files
 - Real-time file monitoring
 - Live process guard for high-risk script hosts
+- Network monitor with burst/c2 heuristics and trusted-client noise reduction
 - Self-protection rules so Ragnar does not rescan or quarantine its own workspace, build outputs, helper, or app data
 - GitHub updater with manifest comparison and staged `.exe` downloads
 - Tkinter GUI with scan, monitoring, history, and blocklist tabs
@@ -80,6 +82,26 @@ python main.py --check-updates --nogui
 python main.py --update-status --nogui
 ```
 
+Show staged protection and queue status:
+
+```powershell
+python main.py --protection-status --nogui
+python main.py --cloud-status --nogui
+```
+
+Run local benchmark report on a labeled corpus:
+
+```powershell
+python main.py --benchmark C:\Corpus
+```
+
+Run a generated hard benchmark corpus (safe synthetic samples):
+
+```powershell
+python main.py --benchmark-hard
+python main.py --benchmark-hard C:\RagnarHardCorpus
+```
+
 Check automatic error-report mail status:
 
 ```powershell
@@ -128,5 +150,6 @@ python .\scripts\build_update_manifest.py --exe .\dist\RagnarProtect.exe --repo 
 - AMSI and Authenticode checks work only on Windows.
 - Process blocking and process guard are stronger with `psutil` installed.
 - YARA scanning is enabled when `yara-python` is installed successfully.
+- `--benchmark-hard` generates a challenging synthetic corpus (including EICAR, ransomware-like sabotage chains, and multi-stage script chains) without shipping real malware.
 - The default update source is `ragnar152743/ragnar-protect-MAJ` on branch `main`.
 - Automatic error-report emails require a Resend API key from `RAGNAR_RESEND_API_KEY` or a local key file such as `dist\RagnarProtect.resend_key.txt`; recipient and sender can be overridden with `RAGNAR_ERROR_REPORT_TO` and `RAGNAR_ERROR_REPORT_FROM`.

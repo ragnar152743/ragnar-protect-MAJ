@@ -4,7 +4,7 @@ import threading
 import time
 from pathlib import Path
 
-from .config import CANARY_FILE_NAMES, DEFAULT_MONITORED_DIRS, SENSITIVE_EXTENSIONS, is_managed_path
+from .config import CANARY_FILE_NAMES, DEFAULT_MONITORED_DIRS, OFFICE_DOCUMENT_EXTENSIONS, SENSITIVE_EXTENSIONS, is_managed_path
 from .logging_setup import get_logger
 from .scanner import RagnarScanner
 
@@ -62,7 +62,7 @@ class RagnarEventHandler(FileSystemEventHandler):
             return
         if path.name.startswith("__PSScriptPolicyTest_"):
             return
-        if path.suffix.lower() not in SENSITIVE_EXTENSIONS and path.suffix.lower() not in {".zip", ".tar", ".gz"}:
+        if path.suffix.lower() not in (SENSITIVE_EXTENSIONS | OFFICE_DOCUMENT_EXTENSIONS) and path.suffix.lower() not in {".zip", ".tar", ".gz"}:
             return
         now = time.time()
         if now - self._recent.get(src_path, 0) < 2:
@@ -136,7 +136,7 @@ class FileSystemMonitor:
                         continue
                     if is_managed_path(path):
                         continue
-                    if path.suffix.lower() not in SENSITIVE_EXTENSIONS and path.suffix.lower() not in {".zip", ".tar", ".gz"} and path.name not in CANARY_FILE_NAMES:
+                    if path.suffix.lower() not in (SENSITIVE_EXTENSIONS | OFFICE_DOCUMENT_EXTENSIONS) and path.suffix.lower() not in {".zip", ".tar", ".gz"} and path.name not in CANARY_FILE_NAMES:
                         continue
                     seen_paths.add(str(path))
                     try:
@@ -156,7 +156,7 @@ class FileSystemMonitor:
                                 )
                             except Exception:
                                 pass
-                        if path.suffix.lower() in SENSITIVE_EXTENSIONS or path.suffix.lower() in {".zip", ".tar", ".gz"}:
+                        if path.suffix.lower() in (SENSITIVE_EXTENSIONS | OFFICE_DOCUMENT_EXTENSIONS) or path.suffix.lower() in {".zip", ".tar", ".gz"}:
                             try:
                                 self.scanner.scan_file(path)
                             except Exception:

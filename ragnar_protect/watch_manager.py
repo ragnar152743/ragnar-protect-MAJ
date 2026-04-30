@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from .cloud_reputation import CloudReputationClient
-from .config import WATCH_AUTO_UNBLOCK_DAYS, WATCH_REQUIRED_CLEAN_SCANS, is_managed_path
+from .config import NON_DESTRUCTIVE_MODE, WATCH_AUTO_UNBLOCK_DAYS, WATCH_REQUIRED_CLEAN_SCANS, is_managed_path
 from .database import Database
 from .logging_setup import get_logger
 from .models import BehaviorIncident, FileScanResult, WatchedFileState
@@ -318,6 +318,9 @@ class WatchManager:
             self.logger.warning("auto-unblocked watched file | %s", restored_path)
 
     def _destroy_quarantine_copy(self, tracked_path: str, sha256: str, quarantined_path: str) -> None:
+        if NON_DESTRUCTIVE_MODE:
+            self.logger.warning("non-destructive mode active; quarantine destruction skipped | %s", quarantined_path)
+            return
         target = Path(quarantined_path)
         if not target.exists():
             return

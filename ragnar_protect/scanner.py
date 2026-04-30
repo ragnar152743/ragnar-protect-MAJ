@@ -26,11 +26,14 @@ from .config import (
     MAX_ARCHIVE_TOTAL_BYTES,
     MAX_BASE64_BLOB_LENGTH,
     MAX_FILE_SCAN_BYTES,
+    NON_DESTRUCTIVE_MODE,
+    OFFICE_DOCUMENT_EXTENSIONS,
     PE_EXTENSIONS,
     QUARANTINE_DIR,
     SENSITIVE_EXTENSIONS,
     SUSPICIOUS_IMPORTS,
     SUSPICIOUS_THRESHOLD,
+    TRUSTED_PUBLISHER_TOKENS,
     TEXT_SCRIPT_EXTENSIONS,
     USER_SPACE_HINTS,
     ensure_app_dirs,
@@ -40,7 +43,9 @@ from .database import Database
 from .defender_bridge import DefenderBridge
 from .exe_sandbox import ExecutableSandbox
 from .logging_setup import get_logger
+from .malwarebazaar import MalwareBazaarClient
 from .models import FileScanResult, ScanFinding
+from .office_scanner import OfficeMacroScanner
 from .rule_loader import compile_behavior_rules
 from .sandbox import LimitedSandbox
 from .yara_support import YaraScanner
@@ -54,6 +59,25 @@ except Exception:  # pragma: no cover
 TEXT_ENCODINGS = ("utf-8", "utf-16", "utf-16-le", "latin-1")
 ASCII_STRINGS_RE = re.compile(rb"[ -~]{5,}")
 BASE64_BLOB_RE = re.compile(r"[A-Za-z0-9+/=]{80,}")
+EICAR_TEST_STRING = b"X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*"
+EICAR_TRAILING_WHITESPACE = {9, 10, 13, 26, 32}
+LOLBIN_EXECUTION_RE = re.compile(r"(?i)\b(mshta|rundll32|regsvr32|wmic|wscript|cscript|powershell|pwsh|cmd)(?:\.exe)?\b")
+RANSOMWARE_TRAVERSAL_TOKEN_RE = re.compile(
+    r"(?i)\b(os\.walk|path\.rglob|get-childitem\b[^\r\n]{0,64}-recurse|forfiles(?:\.exe)?\b|dir\s+/s\b|find\s+.*-recurse)\b"
+)
+RANSOMWARE_CRYPTO_TOKEN_RE = re.compile(
+    r"(?i)\b(aes(?:managed|crypto)?|rijndael|cryptostream|fernet|pyaescrypt|chacha20|rsa\.encrypt|cryptencrypt|frombase64string)\b"
+)
+RANSOMWARE_REWRITE_TOKEN_RE = re.compile(
+    r"(?i)\b(rename-item|move-item|set-content|writeallbytes|remove-item|os\.remove|unlink\(|ren\s+|del\s+|erase\s+|copy-item)\b"
+)
+RANSOMWARE_TARGET_EXT_RE = re.compile(r"(?i)\.(docx?|xlsx?|pptx?|pdf|txt|jpg|jpeg|png|csv|sql|db|psd)\b")
+RANSOMWARE_NOTE_TOKEN_RE = re.compile(
+    r"(?i)\b(readme(?:_decrypt)?|how[_ -]?to[_ -]?decrypt|recover[_ -]?files|restore[_ -]?files|your[_ -]?files[_ -]?are[_ -]?encrypted)\b"
+)
+RANSOMWARE_RECOVERY_SABOTAGE_RE = re.compile(
+    r"(?i)\b(vssadmin(?:\.exe)?\s+delete\s+shadows|wbadmin(?:\.exe)?\s+delete\s+catalog|bcdedit(?:\.exe)?\s+/set\s+\{default\}\s+recoveryenabled\s+no|bcdedit(?:\.exe)?\s+/set\s+\{default\}\s+bootstatuspolicy\s+ignoreallfailures|wevtutil(?:\.exe)?\s+cl\s+|cipher(?:\.exe)?\s+/w:|diskshadow(?:\.exe)?\b[^\r\n]{0,64}\bdelete\b[^\r\n]{0,32}\bshadow)\b"
+)
 PE_STRING_RULE_NAMES = {
     "shadow_copy_delete",
     "backup_catalog_delete",
@@ -62,6 +86,19 @@ PE_STRING_RULE_NAMES = {
     "cipher_wipe",
     "defender_tamper",
     "ransomware_note_phrase",
+}
+NOISY_PACKER_FINDING_KINDS = {
+    "sensitive_extension",
+    "high_entropy",
+    "pe_high_entropy_section",
+    "pe_packer_heuristic",
+    "pe_overlay_stub",
+    "pe_upx_sections",
+    "authenticode_issue",
+    "unsigned_pe",
+    "defender_attention",
+    "yara_ragnar_pe_upx_sections",
+    "yara_ragnar_pe_lowimport_overlay",
 }
 
 
@@ -77,6 +114,8 @@ class RagnarScanner:
         self.exe_sandbox = ExecutableSandbox()
         self.compiled_patterns = compile_behavior_rules()
         self.yara = YaraScanner()
+        self.office = OfficeMacroScanner()
+        self.malwarebazaar = MalwareBazaarClient()
         self._result_callbacks: list[Callable[[FileScanResult], None]] = []
 
     def register_result_callback(self, callback: Callable[[FileScanResult], None]) -> None:
@@ -103,7 +142,11 @@ class RagnarScanner:
     def scan_file(self, file_path: Path, persist: bool = True, archive_depth: int = 0) -> FileScanResult:
         file_path = file_path.expanduser().resolve()
         size = file_path.stat().st_size
+        if self.database.is_path_allowlisted(str(file_path)):
+            return self._allowlisted_result(file_path, size=size, persist=persist, reason="whitelisted path")
         sha256 = self._sha256_file(file_path)
+        if self.database.is_hash_allowlisted(sha256):
+            return self._allowlisted_result(file_path, size=size, sha256=sha256, persist=persist, reason="whitelisted hash")
         data = self._read_scan_bytes(file_path)
         return self._scan_bytes(
             display_path=str(file_path),
@@ -207,11 +250,34 @@ class RagnarScanner:
             )
             score += 15
 
+        if self._is_eicar_test_file(data):
+            findings.append(
+                ScanFinding(
+                    kind="eicar_test_file",
+                    title="EICAR test signature",
+                    score=95,
+                    description="File matches the EICAR anti-malware test signature.",
+                    details={"source": "eicar-standard"},
+                )
+            )
+            score += 95
+            metadata["eicar_test_file"] = True
+
         text = None if extension in PE_EXTENSIONS else self._decode_text(data)
         if text:
             text_findings, text_score = self._apply_text_rules(text)
             findings.extend(text_findings)
             score += text_score
+            ransomware_findings, ransomware_score = self._apply_ransomware_text_correlation(text, extension)
+            findings.extend(ransomware_findings)
+            score += ransomware_score
+            chain_findings, chain_score = self._apply_behavior_chain_correlation(
+                text=text,
+                extension=extension,
+                prior_findings=[*text_findings, *ransomware_findings],
+            )
+            findings.extend(chain_findings)
+            score += chain_score
 
             long_hits = [item for item in BASE64_BLOB_RE.findall(text) if len(item) >= MAX_BASE64_BLOB_LENGTH]
             if long_hits:
@@ -264,6 +330,28 @@ class RagnarScanner:
             string_findings, string_score = self._apply_binary_string_rules(data)
             findings.extend(string_findings)
             score += string_score
+
+        if on_disk_path is not None and extension in OFFICE_DOCUMENT_EXTENSIONS:
+            office_report = self.office.analyze(on_disk_path)
+            metadata["office"] = office_report
+            if office_report.get("has_macros"):
+                macro_score = 18
+                if int(office_report.get("suspicious_count", 0) or 0) > 0:
+                    macro_score += 22
+                if int(office_report.get("autoexec_count", 0) or 0) > 0:
+                    macro_score += 15
+                if int(office_report.get("ioc_count", 0) or 0) > 0:
+                    macro_score += 15
+                findings.append(
+                    ScanFinding(
+                        kind="office_vba_macros",
+                        title="Office VBA macros detected",
+                        score=min(70, macro_score),
+                        description="Office document contains VBA macros or suspicious macro keywords.",
+                        details=office_report,
+                    )
+                )
+                score += min(70, macro_score)
 
         pe_findings, pe_score, pe_metadata = self._inspect_pe(data, on_disk_path, extension)
         findings.extend(pe_findings)
@@ -375,6 +463,19 @@ class RagnarScanner:
             findings.extend(cloud_findings)
             score += cloud_score
 
+        malwarebazaar_record, malwarebazaar_score, malwarebazaar_findings = self._lookup_malwarebazaar(
+            sha256=sha256,
+            extension=extension,
+            on_disk_path=on_disk_path,
+            metadata=metadata,
+            current_score=score,
+        )
+        if malwarebazaar_record:
+            metadata["malwarebazaar"] = malwarebazaar_record
+        if malwarebazaar_findings:
+            findings.extend(malwarebazaar_findings)
+            score += malwarebazaar_score
+
         status = "clean"
         if score >= MALICIOUS_THRESHOLD or any(f.kind == "amsi_block" for f in findings):
             status = "malicious"
@@ -384,6 +485,14 @@ class RagnarScanner:
         if status == "malicious" and extension in PE_EXTENSIONS and self._should_cap_packed_pe_verdict(findings, metadata):
             status = "suspicious"
             metadata["verdict_cap"] = "packed-pe-heuristics-only"
+        elif status in {"suspicious", "malicious"} and extension in PE_EXTENSIONS and self._should_cap_watch_sandbox_clean_verdict(findings, metadata):
+            status = "clean"
+            score = min(score, 18)
+            metadata["verdict_cap"] = "watch-sandbox-clean-pe"
+        elif status in {"suspicious", "malicious"} and extension in PE_EXTENSIONS and self._should_cap_trusted_signed_pe_verdict(findings, metadata):
+            status = "clean"
+            score = min(score, 20)
+            metadata["verdict_cap"] = "trusted-signed-pe-api-noise"
 
         result = FileScanResult(
             path=display_path,
@@ -402,23 +511,26 @@ class RagnarScanner:
             and self._is_user_space_path(str(on_disk_path))
             and not self._is_managed_app_path(on_disk_path)
         ):
-            quarantine_path = self._quarantine(on_disk_path, sha256)
-            if quarantine_path:
-                result.quarantined_path = quarantine_path
-                quarantine_item_id = self.database.record_quarantine_item(
-                    original_path=str(on_disk_path),
-                    quarantined_path=quarantine_path,
+            if NON_DESTRUCTIVE_MODE:
+                result.metadata["remediation_skipped"] = "non-destructive-mode"
+            else:
+                quarantine_path = self._quarantine(on_disk_path, sha256)
+                if quarantine_path:
+                    result.quarantined_path = quarantine_path
+                    quarantine_item_id = self.database.record_quarantine_item(
+                        original_path=str(on_disk_path),
+                        quarantined_path=quarantine_path,
+                        sha256=sha256,
+                        reason=result.summary(),
+                    )
+                    result.metadata["quarantine_item_id"] = quarantine_item_id
+                self.database.upsert_blocked_file(
+                    path=str(on_disk_path),
                     sha256=sha256,
                     reason=result.summary(),
+                    source="scan",
                 )
-                result.metadata["quarantine_item_id"] = quarantine_item_id
-            self.database.upsert_blocked_file(
-                path=str(on_disk_path),
-                sha256=sha256,
-                reason=result.summary(),
-                source="scan",
-            )
-            result.blocked = True
+                result.blocked = True
         elif status == "malicious" and on_disk_path is not None:
             metadata["remediation_skipped"] = "non-user-space-path"
 
@@ -455,6 +567,175 @@ class RagnarScanner:
             score += int(pattern["score"])
         return findings, score
 
+    def _apply_ransomware_text_correlation(self, text: str, extension: str) -> tuple[list[ScanFinding], int]:
+        findings: list[ScanFinding] = []
+        score = 0
+        lower_text = text.lower()
+
+        traversal_hits = len(RANSOMWARE_TRAVERSAL_TOKEN_RE.findall(lower_text))
+        crypto_hits = len(RANSOMWARE_CRYPTO_TOKEN_RE.findall(lower_text))
+        rewrite_hits = len(RANSOMWARE_REWRITE_TOKEN_RE.findall(lower_text))
+        target_ext_hits = len(RANSOMWARE_TARGET_EXT_RE.findall(lower_text))
+        note_hits = len(RANSOMWARE_NOTE_TOKEN_RE.findall(lower_text))
+        sabotage_hits = len(RANSOMWARE_RECOVERY_SABOTAGE_RE.findall(lower_text))
+
+        if crypto_hits >= 1 and traversal_hits >= 1 and rewrite_hits >= 1 and target_ext_hits >= 1:
+            findings.append(
+                ScanFinding(
+                    kind="ransomware_mass_encryption_logic",
+                    title="Ransomware mass-encryption logic",
+                    score=65,
+                    description="Content combines recursive traversal, crypto primitives, and bulk rewrite indicators.",
+                    details={
+                        "traversal_hits": traversal_hits,
+                        "crypto_hits": crypto_hits,
+                        "rewrite_hits": rewrite_hits,
+                        "target_ext_hits": target_ext_hits,
+                    },
+                )
+            )
+            score += 65
+
+        if sabotage_hits >= 1 and (
+            crypto_hits >= 1
+            or rewrite_hits >= 1
+            or extension in {".cmdline", ".startup", ".task"}
+        ):
+            findings.append(
+                ScanFinding(
+                    kind="ransomware_recovery_sabotage_chain",
+                    title="Ransomware recovery sabotage chain",
+                    score=55,
+                    description="Recovery-disable commands are present alongside destructive or encryption behavior.",
+                    details={
+                        "sabotage_hits": sabotage_hits,
+                        "crypto_hits": crypto_hits,
+                        "rewrite_hits": rewrite_hits,
+                    },
+                )
+            )
+            score += 55
+
+        if note_hits >= 1 and (rewrite_hits >= 1 or target_ext_hits >= 2):
+            findings.append(
+                ScanFinding(
+                    kind="ransomware_note_and_rewrite",
+                    title="Ransom-note and rewrite correlation",
+                    score=40,
+                    description="Ransom-note phrasing appears with mass rewrite indicators.",
+                    details={
+                        "note_hits": note_hits,
+                        "rewrite_hits": rewrite_hits,
+                        "target_ext_hits": target_ext_hits,
+                    },
+                )
+            )
+            score += 40
+
+        # Keep correlation conservative for pure binary blobs.
+        if extension not in TEXT_SCRIPT_EXTENSIONS and extension not in {".cmdline", ".artifact"}:
+            findings = [item for item in findings if item.kind == "ransomware_recovery_sabotage_chain"]
+            score = sum(item.score for item in findings)
+
+        return findings, score
+
+    def _apply_behavior_chain_correlation(
+        self,
+        text: str,
+        extension: str,
+        prior_findings: list[ScanFinding],
+    ) -> tuple[list[ScanFinding], int]:
+        findings: list[ScanFinding] = []
+        score = 0
+        kinds = {item.kind for item in prior_findings}
+        lowered = text.lower()
+
+        if {"powershell_encoded_command", "download_and_exec", "script_exec_chain"}.issubset(kinds):
+            findings.append(
+                ScanFinding(
+                    kind="multi_stage_powershell_chain",
+                    title="Multi-stage PowerShell delivery chain",
+                    score=35,
+                    description="Encoded PowerShell execution is chained with download and script execution behaviors.",
+                )
+            )
+            score += 35
+
+        if (
+            "download_and_exec" in kinds
+            and "dangerous_script_host" in kinds
+            and LOLBIN_EXECUTION_RE.search(lowered)
+        ):
+            findings.append(
+                ScanFinding(
+                    kind="lolbin_delivery_chain",
+                    title="LOLBin delivery chain",
+                    score=28,
+                    description="Download behavior is chained with script host usage and LOLBin execution.",
+                )
+            )
+            score += 28
+
+        lolbin_hits = LOLBIN_EXECUTION_RE.findall(lowered)
+        if extension in {".cmdline", ".artifact"} and len(lolbin_hits) >= 2 and ("http://" in lowered or "https://" in lowered):
+            findings.append(
+                ScanFinding(
+                    kind="lolbin_remote_chain",
+                    title="LOLBin remote execution chain",
+                    score=32,
+                    description="Multiple LOLBins are chained with a remote URL, a common staged execution pattern.",
+                    details={"lolbin_hits": sorted({item.lower() for item in lolbin_hits})},
+                )
+            )
+            score += 32
+
+        if {"ragnar_self_tamper", "startup_task_tamper"}.intersection(kinds) and (
+            {"download_and_exec", "script_exec_chain", "dangerous_script_host"}.intersection(kinds)
+        ):
+            findings.append(
+                ScanFinding(
+                    kind="product_tamper_chain",
+                    title="Product tamper plus payload chain",
+                    score=45,
+                    description="Payload execution indicators are combined with attempts to disable Ragnar Protect.",
+                )
+            )
+            score += 45
+
+        if "memory_injection_api" in kinds and {"script_exec_chain", "dangerous_script_host"}.intersection(kinds):
+            findings.append(
+                ScanFinding(
+                    kind="script_to_injection_chain",
+                    title="Script-to-injection chain",
+                    score=26,
+                    description="Script-host execution is correlated with memory-injection API usage.",
+                )
+            )
+            score += 26
+
+        sabotage_hits = len(RANSOMWARE_RECOVERY_SABOTAGE_RE.findall(lowered))
+        if sabotage_hits >= 1 and {"defender_tamper", "ragnar_self_tamper", "startup_task_tamper"}.intersection(kinds):
+            findings.append(
+                ScanFinding(
+                    kind="defense_and_recovery_sabotage_chain",
+                    title="Defense and recovery sabotage chain",
+                    score=40,
+                    description="Commands targeting endpoint defenses and recovery controls were found together.",
+                    details={"sabotage_hits": sabotage_hits},
+                )
+            )
+            score += 40
+
+        if extension not in TEXT_SCRIPT_EXTENSIONS and extension not in {".cmdline", ".artifact"}:
+            filtered = [
+                item
+                for item in findings
+                if item.kind in {"product_tamper_chain", "defense_and_recovery_sabotage_chain"}
+            ]
+            return filtered, sum(item.score for item in filtered)
+
+        return findings, score
+
     def _apply_pe_string_rules(self, data: bytes, extension: str) -> tuple[list[ScanFinding], int]:
         if extension not in PE_EXTENSIONS:
             return [], 0
@@ -472,6 +753,8 @@ class RagnarScanner:
         artifact_type = str(metadata.get("artifact_type", ""))
         if extension in PE_EXTENSIONS:
             allowed_tags = {"pe"}
+        elif extension in OFFICE_DOCUMENT_EXTENSIONS:
+            allowed_tags = None
         else:
             if artifact_type == "file" and extension not in TEXT_SCRIPT_EXTENSIONS:
                 return [], 0
@@ -559,11 +842,12 @@ class RagnarScanner:
 
             rwx_sections: list[str] = []
             upx_sections: list[str] = []
+            high_entropy_sections: list[dict[str, object]] = []
             high_entropy_exec_sections: list[dict[str, object]] = []
             section_rows: list[dict[str, object]] = []
             for section in pe.sections:
                 name = section.Name.decode("ascii", errors="ignore").strip("\x00")
-                entropy = round(float(section.get_entropy()), 3)
+                entropy = round(self._shannon_entropy(section.get_data() or b""), 3)
                 executable = bool(section.IMAGE_SCN_MEM_EXECUTE)
                 writable = bool(section.IMAGE_SCN_MEM_WRITE)
                 section_rows.append(
@@ -580,8 +864,23 @@ class RagnarScanner:
                     rwx_sections.append(name)
                 if name.upper().startswith("UPX"):
                     upx_sections.append(name)
-                if executable and entropy >= 7.2:
+                if entropy >= 7.0:
+                    high_entropy_sections.append({"name": name, "entropy": entropy, "executable": executable})
+                if executable and entropy >= 7.0:
                     high_entropy_exec_sections.append({"name": name, "entropy": entropy})
+            if high_entropy_sections:
+                entropy_score = min(24, 8 + (4 * max(0, len(high_entropy_sections) - 1)))
+                findings.append(
+                    ScanFinding(
+                        kind="pe_high_entropy_section",
+                        title="High-entropy PE section",
+                        score=entropy_score,
+                        description="One or more PE sections have Shannon entropy above 7.0, a pattern often seen with packed or encrypted payloads.",
+                        details={"sections": high_entropy_sections[:8]},
+                    )
+                )
+                score += entropy_score
+                metadata["high_entropy_sections"] = high_entropy_sections[:12]
             if rwx_sections:
                 findings.append(
                     ScanFinding(
@@ -779,16 +1078,22 @@ class RagnarScanner:
         malicious_hits = sum(1 for row in history if row.get("status") == "malicious")
         suspicious_hits = sum(1 for row in history if row.get("status") == "suspicious")
         clean_hits = sum(1 for row in history if row.get("status") == "clean")
+        watched = self.database.get_watched_file(str(on_disk_path), sha256)
 
         signer_subject = str(signature.get("signer_subject", "")).strip()
         thumbprint = str(signature.get("thumbprint", "")).strip()
-        company_name = str(pe_metadata.get("company_name", "")).strip()
+        signer_issuer = str(signature.get("signer_issuer", "")).strip()
+        company_name = str(pe_metadata.get("company_name") or "").strip()
+        product_name = str(pe_metadata.get("product_name") or "").strip()
+        file_description = str(pe_metadata.get("file_description") or "").strip()
         signature_status = str(signature.get("status", "Unknown"))
+        trusted_publisher_match = self._matches_trusted_publisher(company_name, signer_subject)
 
         reputation_score = 0
         reasons: list[str] = []
         findings: list[ScanFinding] = []
         normalized_path = str(on_disk_path).lower()
+        watch_context: dict[str, object] = {}
 
         if blocked_hash:
             reputation_score -= 100
@@ -825,15 +1130,53 @@ class RagnarScanner:
             reputation_score += min(18, 6 * clean_hits)
             reasons.append(f"{clean_hits} previous clean local scan(s)")
 
+        if watched and not bool(watched.get("confirmed_malware")):
+            sandbox_verdict = str(watched.get("sandbox_verdict") or "unknown")
+            watch_status = str(watched.get("status") or "under_watch")
+            watch_clean_count = int(watched.get("clean_scan_count", 0) or 0)
+            watch_context = {
+                "status": watch_status,
+                "sandbox_verdict": sandbox_verdict,
+                "clean_scan_count": watch_clean_count,
+            }
+            if sandbox_verdict == "clean":
+                watch_bonus = 36 + min(12, watch_clean_count * 4)
+                if watch_status == "auto_unblocked":
+                    watch_bonus += 24
+                reputation_score += watch_bonus
+                reasons.append("previous isolated execution remained clean")
+                watch_context["risk_adjustment_bonus"] = watch_bonus
+
         if signature_status == "Valid":
             reputation_score += 24
             reasons.append("valid Authenticode signature")
+            if trusted_publisher_match:
+                reputation_score += 14
+                reasons.append("trusted publisher baseline")
             if signer_subject and "microsoft" in signer_subject.lower():
                 reputation_score += 16
                 reasons.append("Microsoft signer subject")
             if company_name and signer_subject and self._publisher_matches_subject(company_name, signer_subject):
-                reputation_score += 10
+                reputation_score += 24
                 reasons.append("publisher metadata matches certificate subject")
+            if self._is_probable_installed_app_path(normalized_path):
+                install_bonus = 0
+                if signer_issuer:
+                    install_bonus += 8
+                if pe_metadata.get("overlay_size", 0) or pe_metadata.get("high_entropy_sections"):
+                    install_bonus += 8
+                if not pe_metadata.get("suspicious_imports"):
+                    install_bonus += 6
+                if company_name or product_name or file_description:
+                    install_bonus += 10
+                elif signer_subject:
+                    install_bonus += 6
+                if trusted_publisher_match:
+                    install_bonus += 6
+                install_bonus = min(24, install_bonus)
+                if install_bonus:
+                    reputation_score += install_bonus
+                    reasons.append("signed executable is installed under a normal application path")
         elif signature_status == "NotSigned" and extension in PE_EXTENSIONS:
             reputation_score -= 12
             reasons.append("unsigned portable executable")
@@ -845,7 +1188,7 @@ class RagnarScanner:
             reasons.append(f"Authenticode status {signature_status}")
 
         if self._is_system_trust_path(normalized_path) and signature_status == "Valid":
-            reputation_score += 12
+            reputation_score += 20
             reasons.append("validly signed binary under a trusted system path")
 
         if extension in PE_EXTENSIONS and self._is_user_space_path(normalized_path) and signature_status != "Valid":
@@ -868,12 +1211,12 @@ class RagnarScanner:
         elif reputation_score <= -25:
             verdict = "risky"
             risk_adjustment = 10
-        elif reputation_score >= 50:
+        elif reputation_score >= 70:
             verdict = "trusted"
-            risk_adjustment = -18
-        elif reputation_score >= 25:
+            risk_adjustment = -55
+        elif reputation_score >= 45:
             verdict = "known-good"
-            risk_adjustment = -8
+            risk_adjustment = -30
         else:
             verdict = "unknown"
             risk_adjustment = 0
@@ -884,10 +1227,13 @@ class RagnarScanner:
             "history_hits": len(history),
             "blocked_hash": blocked_hash,
             "signer_subject": signer_subject,
+            "signer_issuer": signer_issuer,
             "thumbprint": thumbprint,
             "publisher": company_name,
             "reasons": reasons[:8],
         }
+        if watch_context:
+            reputation["watch_context"] = watch_context
         return reputation, risk_adjustment, findings
 
     def _build_cloud_fingerprint(self, metadata: dict[str, object]) -> dict[str, object]:
@@ -963,6 +1309,37 @@ class RagnarScanner:
             score -= 10
         return record.to_dict(), score, findings
 
+    def _lookup_malwarebazaar(
+        self,
+        sha256: str,
+        extension: str,
+        on_disk_path: Path | None,
+        metadata: dict[str, object],
+        current_score: int,
+    ) -> tuple[dict[str, object], int, list[ScanFinding]]:
+        if on_disk_path is None or extension not in (PE_EXTENSIONS | TEXT_SCRIPT_EXTENSIONS | OFFICE_DOCUMENT_EXTENSIONS):
+            return {}, 0, []
+        if self._is_system_trust_path(str(on_disk_path).lower()) and current_score < SUSPICIOUS_THRESHOLD:
+            return {}, 0, []
+        if current_score < 12 and extension in OFFICE_DOCUMENT_EXTENSIONS:
+            return {}, 0, []
+        record = self.malwarebazaar.lookup_sha256(sha256)
+        if record is None:
+            return {}, 0, []
+        return (
+            record,
+            85,
+            [
+                ScanFinding(
+                    kind="malwarebazaar_known_sample",
+                    title="MalwareBazaar known sample",
+                    score=85,
+                    description="MalwareBazaar returned a known sample for this SHA256.",
+                    details=record,
+                )
+            ],
+        )
+
     def _extract_pe_version_info(self, pe) -> dict[str, object]:
         version_entries: dict[str, str] = {}
         for file_info in getattr(pe, "FileInfo", []) or []:
@@ -1001,6 +1378,19 @@ class RagnarScanner:
             return False
         return publisher_token in subject_token or subject_token in publisher_token
 
+    def _matches_trusted_publisher(self, publisher: str, subject: str) -> bool:
+        publisher_token = re.sub(r"[^a-z0-9]+", " ", str(publisher).lower()).strip()
+        subject_token = re.sub(r"[^a-z0-9]+", " ", str(subject).lower()).strip()
+        if not publisher_token and not subject_token:
+            return False
+        for trusted in TRUSTED_PUBLISHER_TOKENS:
+            token = re.sub(r"[^a-z0-9]+", " ", str(trusted).lower()).strip()
+            if not token:
+                continue
+            if token in publisher_token or token in subject_token:
+                return True
+        return False
+
     def _should_use_defender(self, on_disk_path: Path | None, extension: str, score: int) -> bool:
         if on_disk_path is None or not self.defender.available:
             return False
@@ -1019,6 +1409,59 @@ class RagnarScanner:
         }
         return any(value.startswith(root) for root in trusted_roots)
 
+    def _is_probable_installed_app_path(self, value: str) -> bool:
+        normalized = str(value).lower()
+        if not normalized:
+            return False
+        if self._is_system_trust_path(normalized):
+            return True
+        local_appdata = str(Path(os.getenv("LOCALAPPDATA", ""))).lower()
+        roaming_appdata = str(Path(os.getenv("APPDATA", ""))).lower()
+        roots = tuple(root for root in (local_appdata, roaming_appdata) if root)
+        if not any(normalized.startswith(root) for root in roots):
+            return False
+        risky_segments = (
+            "\\temp\\",
+            "\\tmp\\",
+            "\\downloads\\",
+            "\\desktop\\",
+            "\\documents\\",
+            "\\cache\\",
+            "\\crashdumps\\",
+        )
+        if any(segment in normalized for segment in risky_segments):
+            return False
+        return True
+
+    def is_low_signal_packed_pe_result(self, result: FileScanResult) -> bool:
+        if result.extension not in PE_EXTENSIONS:
+            return False
+        if result.metadata.get("malwarebazaar"):
+            return False
+        defender = result.metadata.get("defender", {})
+        if isinstance(defender, dict) and defender.get("is_malware"):
+            return False
+        cloud = result.metadata.get("cloud_reputation", {})
+        if isinstance(cloud, dict) and str(cloud.get("verdict", "")) in {"known-bad", "malicious", "risky"}:
+            return False
+        reputation = result.metadata.get("reputation", {})
+        reputation = reputation if isinstance(reputation, dict) else {}
+        signature = result.metadata.get("authenticode", {})
+        signature = signature if isinstance(signature, dict) else {}
+        pe_metadata = result.metadata.get("pe", {})
+        pe_metadata = pe_metadata if isinstance(pe_metadata, dict) else {}
+        finding_kinds = {finding.kind for finding in result.findings}
+        if not finding_kinds or not finding_kinds.issubset(NOISY_PACKER_FINDING_KINDS):
+            return False
+        if pe_metadata.get("suspicious_imports"):
+            return False
+        if result.score > 60:
+            return False
+        return (
+            str(signature.get("status", "")) == "Valid"
+            or str(reputation.get("verdict", "")) in {"trusted", "known-good"}
+        )
+
     def _should_cap_packed_pe_verdict(
         self,
         findings: list[ScanFinding],
@@ -1027,6 +1470,7 @@ class RagnarScanner:
         allowed_kinds = {
             "sensitive_extension",
             "high_entropy",
+            "pe_high_entropy_section",
             "pe_rwx_section",
             "pe_upx_sections",
             "pe_packer_heuristic",
@@ -1057,7 +1501,69 @@ class RagnarScanner:
             return False
         return str(signature.get("status", "Unknown")) not in {"HashMismatch", "NotTrusted", "NotSignatureValid"}
 
+    def _should_cap_trusted_signed_pe_verdict(
+        self,
+        findings: list[ScanFinding],
+        metadata: dict[str, object],
+    ) -> bool:
+        signature = metadata.get("authenticode", {})
+        signature = signature if isinstance(signature, dict) else {}
+        reputation = metadata.get("reputation", {})
+        reputation = reputation if isinstance(reputation, dict) else {}
+        if str(signature.get("status", "")) != "Valid":
+            return False
+        if str(reputation.get("verdict", "")) not in {"trusted", "known-good"}:
+            return False
+        if metadata.get("malwarebazaar"):
+            return False
+        defender = metadata.get("defender", {})
+        if isinstance(defender, dict) and defender.get("is_malware"):
+            return False
+        cloud = metadata.get("cloud_reputation", {})
+        if isinstance(cloud, dict) and str(cloud.get("verdict", "")) in {"known-bad", "malicious", "risky"}:
+            return False
+        finding_kinds = {finding.kind for finding in findings}
+        allowed_kinds = {
+            "sensitive_extension",
+            "pe_suspicious_imports",
+            "yara_ragnar_pe_injection_apis",
+            "pe_high_entropy_section",
+            "pe_packer_heuristic",
+            "pe_overlay_stub",
+            "high_entropy",
+            "unsigned_pe",
+        }
+        return bool(finding_kinds) and all(kind in allowed_kinds for kind in finding_kinds)
+
+    def _should_cap_watch_sandbox_clean_verdict(
+        self,
+        findings: list[ScanFinding],
+        metadata: dict[str, object],
+    ) -> bool:
+        reputation = metadata.get("reputation", {})
+        reputation = reputation if isinstance(reputation, dict) else {}
+        watch_context = reputation.get("watch_context", {})
+        watch_context = watch_context if isinstance(watch_context, dict) else {}
+        if str(watch_context.get("sandbox_verdict", "")) != "clean":
+            return False
+        if metadata.get("malwarebazaar"):
+            return False
+        defender = metadata.get("defender", {})
+        if isinstance(defender, dict) and defender.get("is_malware"):
+            return False
+        cloud = metadata.get("cloud_reputation", {})
+        if isinstance(cloud, dict) and str(cloud.get("verdict", "")) in {"known-bad", "malicious", "risky"}:
+            return False
+        signature = metadata.get("authenticode", {})
+        signature = signature if isinstance(signature, dict) else {}
+        if str(signature.get("status", "")) != "Valid" and str(watch_context.get("status", "")) != "auto_unblocked":
+            return False
+        finding_kinds = {finding.kind for finding in findings}
+        return bool(finding_kinds) and finding_kinds.issubset(NOISY_PACKER_FINDING_KINDS)
+
     def _quarantine(self, file_path: Path, sha256: str) -> str | None:
+        if NON_DESTRUCTIVE_MODE:
+            return None
         ensure_app_dirs()
         target = QUARANTINE_DIR / f"{sha256[:12]}_{file_path.name}"
         if file_path.resolve() == target.resolve():
@@ -1094,6 +1600,9 @@ class RagnarScanner:
             "quarantined_path": "",
             "quarantine_item_id": None,
         }
+        if NON_DESTRUCTIVE_MODE:
+            remediation["reason"] = "non-destructive-mode"
+            return remediation
         if not candidate.exists() or not candidate.is_file():
             return remediation
         if not self._is_user_space_path(str(candidate)) or self._is_managed_app_path(candidate):
@@ -1144,6 +1653,9 @@ class RagnarScanner:
             confirmations += 1
         cloud = result.metadata.get("cloud_reputation", {})
         if isinstance(cloud, dict) and str(cloud.get("verdict", "")) in {"known-bad", "malicious"}:
+            confirmations += 1
+        malwarebazaar = result.metadata.get("malwarebazaar", {})
+        if isinstance(malwarebazaar, dict) and malwarebazaar.get("sha256_hash"):
             confirmations += 1
         return confirmations
 
@@ -1201,11 +1713,49 @@ class RagnarScanner:
         except Exception:
             return False
 
+    def _is_eicar_test_file(self, data: bytes) -> bool:
+        if len(data) < len(EICAR_TEST_STRING) or len(data) > 128:
+            return False
+        if not data.startswith(EICAR_TEST_STRING):
+            return False
+        trailing = data[len(EICAR_TEST_STRING) :]
+        return all(byte in EICAR_TRAILING_WHITESPACE for byte in trailing)
+
     def _normalized_extension(self, path: Path) -> str:
         suffixes = [suffix.lower() for suffix in path.suffixes]
         if len(suffixes) >= 2 and "".join(suffixes[-2:]) == ".tar.gz":
             return ".tar.gz"
         return path.suffix.lower()
+
+    def _allowlisted_result(
+        self,
+        file_path: Path,
+        size: int,
+        sha256: str = "",
+        persist: bool = True,
+        reason: str = "whitelisted",
+    ) -> FileScanResult:
+        result = FileScanResult(
+            path=str(file_path),
+            sha256=sha256 or self._sha256_file(file_path),
+            size=size,
+            extension=self._normalized_extension(file_path),
+            status="clean",
+            score=0,
+            findings=[
+                ScanFinding(
+                    kind="allowlisted",
+                    title="Allowlisted item",
+                    score=0,
+                    description=f"Scan bypassed because this item is in the {reason}.",
+                )
+            ],
+            metadata={"allowlisted": True, "allowlist_reason": reason},
+        )
+        if persist:
+            self.database.record_detection(result)
+        self._emit_result(result)
+        return result
 
     def format_results(self, results: Iterable[FileScanResult]) -> str:
         lines = []

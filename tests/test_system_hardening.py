@@ -7,7 +7,7 @@ from pathlib import Path
 from subprocess import CompletedProcess
 from unittest.mock import patch
 
-os.environ.setdefault("RAGNAR_APP_DIR", str(Path(tempfile.gettempdir()) / "ragnar-protect-tests"))
+os.environ["RAGNAR_APP_DIR"] = tempfile.mkdtemp(prefix="ragnar-protect-tests-")
 
 from ragnar_protect.database import Database
 from ragnar_protect.rollback_cache import RollbackCache

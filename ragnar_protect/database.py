@@ -76,6 +76,16 @@ class Database:
                     reason TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS allowlist (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    entry_type TEXT NOT NULL,
+                    value TEXT NOT NULL,
+                    note TEXT NOT NULL DEFAULT '',
+                    active INTEGER NOT NULL DEFAULT 1,
+                    UNIQUE(entry_type, value)
+                );
+
                 CREATE TABLE IF NOT EXISTS wallpaper_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     event_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -290,6 +300,69 @@ class Database:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def upsert_allowlist_entry(self, entry_type: str, value: str, note: str = "") -> None:
+        normalized_type = str(entry_type).strip().lower()
+        normalized_value = str(value).strip()
+        with self._lock, self._managed_connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO allowlist (entry_type, value, note, active)
+                VALUES (?, ?, ?, 1)
+                ON CONFLICT(entry_type, value) DO UPDATE SET
+                    note = excluded.note,
+                    active = 1
+                """,
+                (normalized_type, normalized_value, note.strip()),
+            )
+
+    def list_allowlist_entries(self, active_only: bool = True) -> list[dict[str, Any]]:
+        query = """
+            SELECT id, created_at, entry_type, value, note, active
+            FROM allowlist
+        """
+        params: tuple[object, ...] = ()
+        if active_only:
+            query += " WHERE active = 1"
+        query += " ORDER BY id DESC"
+        with self._lock, self._managed_connection() as connection:
+            rows = connection.execute(query, params).fetchall()
+        return [dict(row) for row in rows]
+
+    def deactivate_allowlist_entry(self, entry_id: int) -> None:
+        with self._lock, self._managed_connection() as connection:
+            connection.execute("UPDATE allowlist SET active = 0 WHERE id = ?", (entry_id,))
+
+    def is_path_allowlisted(self, path: str) -> bool:
+        normalized = str(path).strip().lower()
+        with self._lock, self._managed_connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT value
+                FROM allowlist
+                WHERE active = 1 AND entry_type = 'path'
+                """,
+            ).fetchall()
+        for row in rows:
+            candidate = str(row["value"]).strip().lower()
+            if not candidate:
+                continue
+            if normalized == candidate or normalized.startswith(candidate.rstrip("\\/") + "\\"):
+                return True
+        return False
+
+    def is_hash_allowlisted(self, sha256: str) -> bool:
+        with self._lock, self._managed_connection() as connection:
+            row = connection.execute(
+                """
+                SELECT 1
+                FROM allowlist
+                WHERE active = 1 AND entry_type = 'hash' AND lower(value) = lower(?)
+                LIMIT 1
+                """,
+                (sha256,),
+            ).fetchone()
+        return row is not None
+
     def deactivate_blocked_file(self, path: str, sha256: str) -> None:
         with self._lock, self._managed_connection() as connection:
             connection.execute(
@@ -399,6 +472,85 @@ class Database:
                 (limit,),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def get_dashboard_summary(self) -> dict[str, Any]:
+        with self._lock, self._managed_connection() as connection:
+            total_scans = int(connection.execute("SELECT COUNT(*) FROM detections").fetchone()[0])
+            suspicious_scans = int(connection.execute("SELECT COUNT(*) FROM detections WHERE status = 'suspicious'").fetchone()[0])
+            malicious_scans = int(connection.execute("SELECT COUNT(*) FROM detections WHERE status = 'malicious'").fetchone()[0])
+            today_detections = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM detections WHERE date(scanned_at) = date('now')"
+                ).fetchone()[0]
+            )
+            today_blocks = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM block_events WHERE date(blocked_at) = date('now')"
+                ).fetchone()[0]
+            )
+            watch_count = int(connection.execute("SELECT COUNT(*) FROM watched_files WHERE status != 'auto_unblocked'").fetchone()[0])
+            sandbox_queue = int(connection.execute("SELECT COUNT(*) FROM sandbox_queue WHERE status IN ('pending', 'running')").fetchone()[0])
+        return {
+            "total_scans": total_scans,
+            "suspicious_scans": suspicious_scans,
+            "malicious_scans": malicious_scans,
+            "detections_today": today_detections,
+            "blocks_today": today_blocks,
+            "watched_files": watch_count,
+            "sandbox_queue": sandbox_queue,
+        }
+
+    def get_detection_counts_by_day(self, days: int = 7) -> list[dict[str, Any]]:
+        with self._lock, self._managed_connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT date(scanned_at) AS day,
+                       COUNT(*) AS scan_count,
+                       SUM(CASE WHEN status = 'suspicious' THEN 1 ELSE 0 END) AS suspicious_count,
+                       SUM(CASE WHEN status = 'malicious' THEN 1 ELSE 0 END) AS malicious_count
+                FROM detections
+                WHERE datetime(scanned_at) >= datetime('now', ?)
+                GROUP BY date(scanned_at)
+                ORDER BY day DESC
+                """,
+                (f"-{int(days)} days",),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def list_recent_dashboard_events(self, limit: int = 20) -> list[dict[str, Any]]:
+        events: list[dict[str, Any]] = []
+        for row in self.list_recent_detections(limit=max(1, limit // 2)):
+            events.append(
+                {
+                    "event_at": row["scanned_at"],
+                    "category": "detection",
+                    "severity": row["status"],
+                    "message": row["summary"],
+                    "path": row["path"],
+                }
+            )
+        for row in self.list_recent_block_events(limit=max(1, limit // 2)):
+            events.append(
+                {
+                    "event_at": row["blocked_at"],
+                    "category": "block",
+                    "severity": "blocked",
+                    "message": row["reason"],
+                    "path": row.get("exe_path", ""),
+                }
+            )
+        for row in self.list_recent_behavior_events(limit=max(1, limit // 2)):
+            events.append(
+                {
+                    "event_at": row["observed_at"],
+                    "category": "behavior",
+                    "severity": row["stage"],
+                    "message": row["reason"],
+                    "path": row.get("process_path", ""),
+                }
+            )
+        events.sort(key=lambda item: str(item["event_at"]), reverse=True)
+        return events[:limit]
 
     def get_hash_history(self, sha256: str, limit: int = 20) -> list[dict[str, Any]]:
         with self._lock, self._managed_connection() as connection:

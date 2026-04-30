@@ -35,9 +35,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--error-report-status", action="store_true", help="Show automatic error report mail status")
     parser.add_argument("--check-updates", action="store_true", help="Check the GitHub manifest and stage a newer executable")
     parser.add_argument("--update-status", action="store_true", help="Show the current updater state")
+    parser.add_argument("--update-yara-rules", action="store_true", help="Refresh community YARA rules from GitHub")
     parser.add_argument("--list-quarantine", action="store_true", help="List active quarantine items")
     parser.add_argument("--restore-quarantine", type=int, help="Restore a quarantine item by id")
     parser.add_argument("--benchmark", help="Run a local benchmark from a corpus folder with clean/malicious/ransomware subfolders")
+    parser.add_argument(
+        "--benchmark-hard",
+        nargs="?",
+        const="",
+        help="Generate a hard synthetic corpus and run a benchmark (optional output directory)",
+    )
     parser.add_argument(
         "--monitor-seconds",
         type=int,
@@ -67,9 +74,11 @@ def _has_explicit_cli_action(args: argparse.Namespace) -> bool:
             args.error_report_status,
             args.check_updates,
             args.update_status,
+            getattr(args, "update_yara_rules", False),
             args.list_quarantine,
             args.restore_quarantine is not None,
             getattr(args, "benchmark", None),
+            getattr(args, "benchmark_hard", None) is not None,
             args.monitor_seconds,
         ]
     )
@@ -217,6 +226,11 @@ def main() -> int:
         for key, value in status.items():
             _emit_output(f"{key}: {value}")
 
+    if getattr(args, "update_yara_rules", False):
+        status = engine.update_yara_rules()
+        for key, value in status.items():
+            _emit_output(f"{key}: {value}")
+
     if args.list_quarantine:
         for row in engine.list_quarantine_items():
             _emit_output(
@@ -228,6 +242,12 @@ def main() -> int:
 
     if getattr(args, "benchmark", None):
         report = engine.run_benchmark(args.benchmark)
+        for key, value in report.items():
+            _emit_output(f"{key}: {value}")
+
+    if getattr(args, "benchmark_hard", None) is not None:
+        output_dir = args.benchmark_hard.strip() if isinstance(args.benchmark_hard, str) else ""
+        report = engine.run_hard_benchmark(output_dir or None)
         for key, value in report.items():
             _emit_output(f"{key}: {value}")
 
